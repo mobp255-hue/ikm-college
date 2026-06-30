@@ -1,4 +1,7 @@
 flask
 flask-socketio
 eventlet
+gunicorn
 markupsafe
+flask-sqlalchemy
+psycopg2-binary
