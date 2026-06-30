@@ -1,7 +1,6 @@
 flask
 flask-socketio
-gevent
-gevent-websocket
+eventlet
 gunicorn
 markupsafe
 flask-sqlalchemy
