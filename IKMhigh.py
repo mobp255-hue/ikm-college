@@ -3,8 +3,8 @@
 
 """
 IKM High School - Complete School Management System
-PostgreSQL connection hardcoded (Render DB).
-ALL TEMPLATES, ROUTES, AND FEATURES INCLUDED.
+PostgreSQL, all templates, all routes, full CRUD, real-time chat.
+Final production version – all fixes applied.
 """
 
 import os
@@ -20,6 +20,7 @@ from flask import (
 )
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import inspect, text
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from markupsafe import escape
@@ -30,10 +31,10 @@ from markupsafe import escape
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
-# ---------- PostgreSQL Connection (hardcoded) ----------
-app.config['SQLALCHEMY_DATABASE_URI'] = (
-    "postgresql://ikm_high_school_user:4ausw1d6EL7oyRVEw2qXogCkGqME9800@"
-    "dpg-d91mscjtqb8s739bd720-a.oregon-postgres.render.com/ikm_high_school"
+# Use DATABASE_URL from environment, fallback for local testing
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL',
+    'postgresql://user:pass@localhost/db'  # local fallback
 )
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(hours=24)
@@ -63,9 +64,9 @@ ESTABLISHED = "2024"
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(128), nullable=False)
+    password_hash = db.Column(db.String(512), nullable=False)   # increased length
     full_name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=False)  # increased length
     role = db.Column(db.String(20), nullable=False, default='student')
     student_id = db.Column(db.String(20), unique=True, nullable=True)
     class_id = db.Column(db.Integer, db.ForeignKey('class.id'), nullable=True)
@@ -137,7 +138,7 @@ class ChatMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     receiver_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    room = db.Column(db.String(50))          # 'group', 'private_admin', or class name
+    room = db.Column(db.String(50))
     message = db.Column(db.Text, nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
@@ -145,14 +146,38 @@ class SiteSetting(db.Model):
     key = db.Column(db.String(50), primary_key=True)
     value = db.Column(db.String(500))
 
-# Create tables and default admin
+# ------------------------------
+# Database Initialization with Column Upgrades
+# ------------------------------
+def upgrade_columns():
+    """Automatically alter column types to avoid truncation errors."""
+    with app.app_context():
+        inspector = inspect(db.engine)
+        if 'user' in inspector.get_table_names():
+            with db.engine.connect() as conn:
+                # Check password_hash length
+                result = conn.execute(text("""
+                    SELECT character_maximum_length
+                    FROM information_schema.columns
+                    WHERE table_name='user' AND column_name='password_hash'
+                """))
+                row = result.fetchone()
+                if row and row[0] < 512:
+                    conn.execute(text("ALTER TABLE \"user\" ALTER COLUMN password_hash TYPE VARCHAR(512)"))
+                    conn.execute(text("ALTER TABLE \"user\" ALTER COLUMN email TYPE VARCHAR(255)"))
+                    conn.commit()
+                    print("✅ Column types upgraded successfully.")
+
 with app.app_context():
+    upgrade_columns()
     db.create_all()
+    # Create default admin if not exists
     if not User.query.filter_by(username='admin').first():
         admin = User(username='admin', full_name='System Administrator', email='admin@ikmhigh.ac.zw', role='admin')
         admin.set_password('admin123')
         db.session.add(admin)
         db.session.commit()
+    # Set default logo & background
     if not SiteSetting.query.filter_by(key='logo_url').first():
         db.session.add(SiteSetting(key='logo_url', value=SCHOOL_LOGO))
     if not SiteSetting.query.filter_by(key='bg_url').first():
@@ -234,7 +259,7 @@ def update_background_url(url):
     db.session.commit()
 
 # ------------------------------
-# BASE TEMPLATE (modern UI, dark mode, accessibility)
+# Templates (all embedded)
 # ------------------------------
 BASE_TEMPLATE = '''
 <!DOCTYPE html>
@@ -478,10 +503,7 @@ BASE_TEMPLATE = '''
 </html>
 '''
 
-# ------------------------------
-# CONTENT TEMPLATES (all included)
-# ------------------------------
-
+# ----- CONTENT TEMPLATES -----
 HOME_CONTENT = '''
 {% set bg_url = get_background_url() %}
 <section class="hero" style="{% if bg_url %}background: none;{% else %}background: linear-gradient(135deg, #0d6efd, #0a58ca);{% endif %}">
@@ -2476,4 +2498,5 @@ def on_disconnect():
 # ------------------------------
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000)
+    
     
