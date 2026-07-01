@@ -3,8 +3,7 @@
 
 """
 IKM High School - Complete School Management System
-PostgreSQL, all templates, all routes, full CRUD, real-time chat.
-Final production version – all fixes applied.
+FINAL PRODUCTION VERSION - ALL FEATURES, ALL TEMPLATES, ALL ROUTES.
 """
 
 import os
@@ -16,25 +15,29 @@ import re
 from functools import wraps
 from flask import (
     Flask, render_template_string, request, redirect, url_for,
-    session, flash, abort, send_from_directory
+    session, flash, abort, send_from_directory, jsonify, g
 )
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, Index
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from markupsafe import escape
+import bleach
+import psutil
+from PIL import Image
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 
 # ------------------------------
-# App Configuration
+# Configuration
 # ------------------------------
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
-
-# Use DATABASE_URL from environment, fallback for local testing
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL',
-    'postgresql://user:pass@localhost/db'  # local fallback
+    'postgresql://user:pass@localhost/db'
 )
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(hours=24)
@@ -43,12 +46,30 @@ app.config['UPLOAD_FOLDER'] = 'static/uploads'
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = True   # HTTPS only on Render
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['PREFERRED_URL_SCHEME'] = 'https'
+
+Talisman(app, content_security_policy={
+    'default-src': ["'self'"],
+    'script-src': ["'self'", 'https://cdn.jsdelivr.net', 'https://cdn.socket.io', 'https://unpkg.com'],
+    'style-src': ["'self'", 'https://cdn.jsdelivr.net', 'https://unpkg.com'],
+    'img-src': ["'self'", 'data:', 'https://images.unsplash.com', 'https://i.imgur.com'],
+    'font-src': ["'self'", 'https://cdn.jsdelivr.net'],
+    'connect-src': ["'self'", 'ws://localhost:5000'],
+    'frame-src': ["'self'", 'https://www.youtube.com'],
+}, force_https=True, force_https_permanent=True)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
+
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', transports=['polling'])
 
 db = SQLAlchemy(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# School settings
 SCHOOL_NAME = "IKM High School"
 SCHOOL_SHORT = "IKM"
 SCHOOL_LOGO = "https://i.imgur.com/Vdrn2CCh.jpg"
@@ -59,18 +80,20 @@ SCHOOL_MOTTO = "Knowledge · Integrity · Excellence"
 ESTABLISHED = "2024"
 
 # ------------------------------
-# Database Models (PostgreSQL)
+# Database Models (all)
 # ------------------------------
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(512), nullable=False)   # increased length
+    password_hash = db.Column(db.String(512), nullable=False)
     full_name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(255), unique=True, nullable=False)  # increased length
+    email = db.Column(db.String(255), unique=True, nullable=False)
     role = db.Column(db.String(20), nullable=False, default='student')
     student_id = db.Column(db.String(20), unique=True, nullable=True)
     class_id = db.Column(db.Integer, db.ForeignKey('class.id'), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    last_seen = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    avatar_color = db.Column(db.String(7), default='#0d6efd')
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -98,14 +121,16 @@ class Result(db.Model):
     grade = db.Column(db.String(2))
     term = db.Column(db.Integer, nullable=False)
     year = db.Column(db.Integer, nullable=False)
+    __table_args__ = (Index('idx_results_student_subject', 'student_id', 'subject_id'),)
 
-class Fee(db.Model):
+class FeeTransaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    type = db.Column(db.String(20), nullable=False)  # 'charge' or 'payment'
     amount = db.Column(db.Float, nullable=False)
-    paid_date = db.Column(db.Date, nullable=False)
     description = db.Column(db.String(200))
-    balance = db.Column(db.Float, default=0)
+    date = db.Column(db.Date, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 class News(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -141,21 +166,52 @@ class ChatMessage(db.Model):
     room = db.Column(db.String(50))
     message = db.Column(db.Text, nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    read_at = db.Column(db.DateTime, nullable=True)
 
 class SiteSetting(db.Model):
     key = db.Column(db.String(50), primary_key=True)
-    value = db.Column(db.String(500))
+    value = db.Column(db.Text)
 
-# ------------------------------
-# Database Initialization with Column Upgrades
+class Translation(db.Model):
+    key = db.Column(db.String(100), primary_key=True)
+    en = db.Column(db.Text)
+    fr = db.Column(db.Text)
+    sn = db.Column(db.Text)
+
+class AIConversation(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    session_id = db.Column(db.String(50), nullable=False)
+    question = db.Column(db.Text)
+    answer = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class TimetableSlot(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    class_id = db.Column(db.Integer, db.ForeignKey('class.id'), nullable=False)
+    day_of_week = db.Column(db.Integer, nullable=False)
+    period = db.Column(db.Integer, nullable=False)
+    subject_id = db.Column(db.Integer, db.ForeignKey('subject.id'), nullable=False)
+    teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    room = db.Column(db.String(20))
+
+class Attendance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    student_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    class_id = db.Column(db.Integer, db.ForeignKey('class.id'), nullable=False)
+    date = db.Column(db.Date, nullable=False)
+    status = db.Column(db.String(20), nullable=False)
+    remarks = db.Column(db.String(200))
+    teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    __table_args__ = (Index('idx_attendance_student_date', 'student_id', 'date'),)
+    # ------------------------------
+# Database Initialisation
 # ------------------------------
 def upgrade_columns():
-    """Automatically alter column types to avoid truncation errors."""
     with app.app_context():
         inspector = inspect(db.engine)
         if 'user' in inspector.get_table_names():
             with db.engine.connect() as conn:
-                # Check password_hash length
                 result = conn.execute(text("""
                     SELECT character_maximum_length
                     FROM information_schema.columns
@@ -166,26 +222,93 @@ def upgrade_columns():
                     conn.execute(text("ALTER TABLE \"user\" ALTER COLUMN password_hash TYPE VARCHAR(512)"))
                     conn.execute(text("ALTER TABLE \"user\" ALTER COLUMN email TYPE VARCHAR(255)"))
                     conn.commit()
-                    print("✅ Column types upgraded successfully.")
+        if 'chat_message' in inspector.get_table_names():
+            with db.engine.connect() as conn:
+                cols = inspector.get_columns('chat_message')
+                if not any(c['name'] == 'read_at' for c in cols):
+                    conn.execute(text("ALTER TABLE chat_message ADD COLUMN read_at TIMESTAMP"))
+                    conn.commit()
 
 with app.app_context():
     upgrade_columns()
     db.create_all()
-    # Create default admin if not exists
     if not User.query.filter_by(username='admin').first():
         admin = User(username='admin', full_name='System Administrator', email='admin@ikmhigh.ac.zw', role='admin')
         admin.set_password('admin123')
         db.session.add(admin)
         db.session.commit()
-    # Set default logo & background
-    if not SiteSetting.query.filter_by(key='logo_url').first():
-        db.session.add(SiteSetting(key='logo_url', value=SCHOOL_LOGO))
-    if not SiteSetting.query.filter_by(key='bg_url').first():
-        db.session.add(SiteSetting(key='bg_url', value=''))
+    defaults = {
+        'logo_url': SCHOOL_LOGO,
+        'hero_bg': '',
+        'content_bg': '',
+        'footer_bg': '#1e2a3a',
+        'primary_color': '#0d6efd',
+        'secondary_color': '#6c757d',
+        'font_family': 'Segoe UI, system-ui, sans-serif',
+        'ai_enabled': 'true'
+    }
+    for key, val in defaults.items():
+        if not SiteSetting.query.filter_by(key=key).first():
+            db.session.add(SiteSetting(key=key, value=val))
+    translations = {
+        'welcome': {'en': 'Welcome to', 'fr': 'Bienvenue à', 'sn': 'Tigashirei ku'},
+        'apply_now': {'en': 'Apply Now', 'fr': 'Postuler maintenant', 'sn': 'Nyorera zvino'},
+        'read_more': {'en': 'Read More', 'fr': 'Lire la suite', 'sn': 'Verenga zvimwe'},
+        'login': {'en': 'Login', 'fr': 'Connexion', 'sn': 'Pinda'},
+        'logout': {'en': 'Logout', 'fr': 'Déconnexion', 'sn': 'Zvibuda'},
+        'dashboard': {'en': 'Dashboard', 'fr': 'Tableau de bord', 'sn': 'Dhibhodhi'},
+        'chat': {'en': 'Chat', 'fr': 'Discuter', 'sn': 'Taura'},
+        'classrooms': {'en': 'Classrooms', 'fr': 'Salles de classe', 'sn': 'Makirasi'},
+        'profile': {'en': 'Profile', 'fr': 'Profil', 'sn': 'Mufananidzo'},
+        'results': {'en': 'Results', 'fr': 'Résultats', 'sn': 'Zvigumisiro'},
+        'fees': {'en': 'Fees', 'fr': 'Frais', 'sn': 'Mari'},
+        'contact': {'en': 'Contact', 'fr': 'Contact', 'sn': 'Bata'},
+        'about': {'en': 'About', 'fr': 'À propos', 'sn': 'Nezve'},
+        'academics': {'en': 'Academics', 'fr': 'Académiques', 'sn': 'Zvidzidzo'},
+        'student_life': {'en': 'Student Life', 'fr': 'Vie étudiante', 'sn': 'Hupenyu hwevadzidzi'},
+        'admissions': {'en': 'Admissions', 'fr': 'Admissions', 'sn': 'Kugamuchirwa'},
+        'news': {'en': 'News', 'fr': 'Actualités', 'sn': 'Nhau'},
+        'gallery': {'en': 'Gallery', 'fr': 'Galerie', 'sn': 'Mifananidzo'},
+        'home': {'en': 'Home', 'fr': 'Accueil', 'sn': 'Pamba'},
+        'quick_links': {'en': 'Quick Links', 'fr': 'Liens rapides', 'sn': 'Zvinongedzo'},
+        'follow_us': {'en': 'Follow Us', 'fr': 'Suivez-nous', 'sn': 'Titevere'},
+        'type_message': {'en': 'Type a message...', 'fr': 'Tapez un message...', 'sn': 'Nyora meseji...'},
+        'send': {'en': 'Send', 'fr': 'Envoyer', 'sn': 'Tuma'},
+        'message_admin': {'en': 'Message admin...', 'fr': 'Message à l\'admin...', 'sn': 'Meseji kuna admin...'},
+        'select_class': {'en': 'Select a class above to start chatting', 'fr': 'Sélectionnez une classe ci-dessus pour commencer', 'sn': 'Sarudza kirasi pamusoro kuti utange kutaura'},
+    }
+    for key, data in translations.items():
+        if not Translation.query.filter_by(key=key).first():
+            t = Translation(key=key, en=data['en'], fr=data['fr'], sn=data['sn'])
+            db.session.add(t)
     db.session.commit()
 
 # ------------------------------
-# Helper Functions
+# Caching
+# ------------------------------
+_cache_settings = {}
+_cache_translations = {}
+_cache_timeout = 300
+
+def get_cached_setting(key, default=''):
+    if key in _cache_settings and time.time() - _cache_settings.get(key+'_time', 0) < _cache_timeout:
+        return _cache_settings[key]
+    val = get_setting(key, default)
+    _cache_settings[key] = val
+    _cache_settings[key+'_time'] = time.time()
+    return val
+
+def get_cached_translation(key, lang='en'):
+    cache_key = f"{key}_{lang}"
+    if cache_key in _cache_translations and time.time() - _cache_translations.get(cache_key+'_time', 0) < _cache_timeout:
+        return _cache_translations[cache_key]
+    val = get_translation(key, lang)
+    _cache_translations[cache_key] = val
+    _cache_translations[cache_key+'_time'] = time.time()
+    return val
+
+# ------------------------------
+# Helpers
 # ------------------------------
 def login_required(f):
     @wraps(f)
@@ -201,7 +324,7 @@ def role_required(role):
         @wraps(f)
         def decorated(*args, **kwargs):
             if 'role' not in session or session['role'] != role:
-                flash('You do not have permission to view this page.', 'danger')
+                flash('You do not have permission.', 'danger')
                 return redirect(url_for('dashboard'))
             return f(*args, **kwargs)
         return decorated
@@ -218,55 +341,94 @@ def validate_csrf_token(token):
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
+def validate_image_content(file):
+    try:
+        img = Image.open(file)
+        img.verify()
+        file.seek(0)
+        return True
+    except:
+        return False
+
 def sanitize_html(content):
-    return escape(content)
+    return bleach.clean(content, tags=['p','br','strong','em','u','h1','h2','h3','h4','h5','h6','ul','ol','li','blockquote','a','img','span','div','table','tr','td','th'], attributes={'a': ['href','title','target'], 'img': ['src','alt','width','height']})
 
 def validate_password(password):
     if len(password) < 8:
-        return False, "Password must be at least 8 characters long."
+        return False, "At least 8 characters."
     if not re.search(r'[A-Z]', password):
-        return False, "Must contain an uppercase letter."
+        return False, "Uppercase letter missing."
     if not re.search(r'[a-z]', password):
-        return False, "Must contain a lowercase letter."
+        return False, "Lowercase letter missing."
     if not re.search(r'[0-9]', password):
-        return False, "Must contain a number."
+        return False, "Number missing."
     if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
-        return False, "Must contain a special character."
+        return False, "Special character missing."
     return True, ""
 
-def get_school_logo():
-    setting = SiteSetting.query.filter_by(key='logo_url').first()
-    return setting.value if setting else SCHOOL_LOGO
+def get_setting(key, default=''):
+    setting = SiteSetting.query.filter_by(key=key).first()
+    return setting.value if setting else default
 
-def update_school_logo(url):
-    setting = SiteSetting.query.filter_by(key='logo_url').first()
+def update_setting(key, value):
+    setting = SiteSetting.query.filter_by(key=key).first()
     if setting:
-        setting.value = url
+        setting.value = value
     else:
-        db.session.add(SiteSetting(key='logo_url', value=url))
+        db.session.add(SiteSetting(key=key, value=value))
     db.session.commit()
+    _cache_settings.pop(key, None)
+    _cache_settings.pop(key+'_time', None)
+
+def get_translation(key, lang='en'):
+    t = Translation.query.filter_by(key=key).first()
+    if t:
+        if lang == 'fr' and t.fr:
+            return t.fr
+        elif lang == 'sn' and t.sn:
+            return t.sn
+        else:
+            return t.en
+    return key
+
+def get_school_logo():
+    return get_cached_setting('logo_url', SCHOOL_LOGO)
 
 def get_background_url():
-    setting = SiteSetting.query.filter_by(key='bg_url').first()
-    return setting.value if setting else ''
+    return get_cached_setting('hero_bg', '')
 
-def update_background_url(url):
-    setting = SiteSetting.query.filter_by(key='bg_url').first()
-    if setting:
-        setting.value = url
-    else:
-        db.session.add(SiteSetting(key='bg_url', value=url))
-    db.session.commit()
+def ai_respond(question):
+    q = question.lower().strip()
+    responses = {
+        'hello': "Hello! How can I help you today?",
+        'hi': "Hi there! Welcome to IKM High School.",
+        'help': "I can help with admissions, academics, school events, and more.",
+        'admissions': "You can apply online via the Admissions page. We accept applications year-round.",
+        'fees': "Fee details are available on the Fees page. Contact the accounts office for specific queries.",
+        'contact': "You can reach us at +263 77 123 4567 or email info@ikmhigh.ac.zw.",
+        'about': "IKM High School is a premier secondary school established in 2024.",
+        'thank you': "You're welcome!",
+        'bye': "Goodbye! Have a great day.",
+        'default': "I'm not sure I understand. Please ask about admissions, fees, contact, about, or type 'help'."
+    }
+    for key in responses:
+        if key in q:
+            return responses[key]
+    return responses['default']
 
-# ------------------------------
-# Templates (all embedded)
+def compute_fee_balance(student_id):
+    charges = db.session.query(db.func.sum(FeeTransaction.amount)).filter_by(student_id=student_id, type='charge').scalar() or 0
+    payments = db.session.query(db.func.sum(FeeTransaction.amount)).filter_by(student_id=student_id, type='payment').scalar() or 0
+    return charges - payments
+    # ------------------------------
+# Templates (embedded)
 # ------------------------------
 BASE_TEMPLATE = '''
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ lang or 'en' }}">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.5, user-scalable=yes">
     <title>{{ SCHOOL_NAME }} - {{ title }}</title>
     <meta name="description" content="{{ SCHOOL_NAME }} - A school of Knowledge, Integrity, and Excellence. Providing quality education in Zimbabwe.">
     <meta name="keywords" content="school, education, Zimbabwe, {{ SCHOOL_NAME }}, high school, secondary, Harare">
@@ -275,6 +437,65 @@ BASE_TEMPLATE = '''
     <link rel="preconnect" href="https://cdn.jsdelivr.net">
     <link rel="preconnect" href="https://unpkg.com">
     <link rel="preconnect" href="https://cdnjs.cloudflare.com">
+    <style>
+        :root { --primary: {{ primary_color }}; --secondary: {{ secondary_color }}; --font: {{ font_family }}; --primary-rgb: 13, 110, 253; }
+        body { font-family: var(--font); background: #f0f4f8; color: #1a1a2e; transition: background 0.3s, color 0.3s; }
+        body.dark-mode { background: #1a1a2e; color: #f0f4f8; }
+        .navbar-brand img { height: 50px; width: auto; }
+        .hero { background: linear-gradient(135deg, var(--primary), #0a58ca); color: white; padding: 60px 0; margin-bottom: 30px; position: relative; overflow: hidden; min-height: 300px; }
+        .hero-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-size: cover; background-position: center; }
+        .hero-bg::after { content: ""; position: absolute; top:0; left:0; width:100%; height:100%; background: linear-gradient(rgba(0,0,0,0.5), rgba(0,0,0,0.3)); }
+        .hero .container { position: relative; z-index: 1; }
+        .hero h1 { font-size: 2.8rem; font-weight: 700; text-shadow: 2px 2px 8px rgba(0,0,0,0.3); }
+        .hero .lead { font-size: 1.2rem; }
+        .card-hover { transition: transform 0.3s ease, box-shadow 0.3s ease; }
+        .card-hover:hover { transform: translateY(-5px); box-shadow: 0 12px 24px rgba(var(--primary-rgb), 0.2); }
+        .chat-box { height: 350px; overflow-y: auto; border: 1px solid #ddd; padding: 15px; background: #f9f9f9; border-radius: 8px; }
+        .chat-msg { margin-bottom: 10px; }
+        .chat-msg .user { font-weight: bold; }
+        .chat-msg .time { font-size: 0.8rem; color: #888; }
+        .chat-msg.self { background: #d1ecf1; padding: 5px 10px; border-radius: 10px; }
+        .chat-msg.other { background: #f8d7da; padding: 5px 10px; border-radius: 10px; }
+        .counter { font-size: 3rem; font-weight: 700; color: #ffc107; text-shadow: 2px 2px 4px rgba(0,0,0,0.2); }
+        .counter-label { color: #f8f9fa; font-weight: 500; }
+        .btn-toggle-dark { background: none; border: none; font-size: 1.5rem; color: white; cursor: pointer; }
+        .glass { background: rgba(255, 255, 255, 0.9); background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px); border-radius: 1rem; box-shadow: 0 8px 32px rgba(0,0,0,0.1); }
+        @media (max-width: 768px) { .hero h1 { font-size: 2rem; } .counter { font-size: 2rem; } }
+        a:focus-visible, button:focus-visible, input:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+        .ai-widget { position: fixed; bottom: 20px; right: 20px; z-index: 999; }
+        .ai-widget .btn { border-radius: 50px; padding: 12px 24px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+        .ai-chat-box { display: none; width: 320px; max-height: 400px; overflow-y: auto; background: white; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); padding: 16px; position: fixed; bottom: 80px; right: 20px; z-index: 1000; }
+        .ai-chat-box.open { display: block; }
+        .dev-panel { position: fixed; bottom: 10px; left: 10px; background: rgba(0,0,0,0.8); color: #0f0; padding: 10px; border-radius: 8px; font-family: monospace; font-size: 12px; z-index: 9999; display: none; }
+        .dev-panel.open { display: block; }
+        .img-fluid { max-width: 100%; height: auto; }
+        .gallery-thumb { width: 100%; height: auto; aspect-ratio: 4/3; object-fit: cover; }
+        .video-container { position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; max-width: 100%; }
+        .video-container iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        .pagination .page-link { color: var(--primary); }
+        .pagination .active .page-link { background: var(--primary); border-color: var(--primary); color: white; }
+        .tab-content { padding-top: 20px; }
+        .img-placeholder { width: 100%; height: 200px; object-fit: cover; border-radius: 10px; }
+        .student-council-img { width: 100%; height: 250px; object-fit: cover; border-radius: 10px; }
+        .admin-sidebar { background: #f8f9fa; min-height: 100vh; }
+        .admin-sidebar .nav-link { color: #333; }
+        .admin-sidebar .nav-link.active { background: var(--primary); color: white; }
+        .list-group-item-action { cursor: pointer; }
+        .quote-container { background: rgba(255,255,255,0.85); backdrop-filter: blur(8px); border-radius: 15px; padding: 30px; text-align: center; color: #1a1a1a; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        .quote-container blockquote { font-size: 1.4rem; font-style: italic; border-left: 4px solid #ffc107; padding-left: 20px; color: #1a1a1a; }
+        .quote-container footer { background: transparent; color: #333; padding: 10px 0 0; }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        [data-aos] { opacity: 0; transition: opacity 0.8s ease, transform 0.8s ease; }
+        [data-aos].aos-animate { opacity: 1; transform: translateY(0); }
+        body.dark-mode .card { background: var(--card-bg); }
+        body.dark-mode .chat-box { background: #2a2a3e; border-color: #444; color: #eee; }
+        body.dark-mode .table { color: #eee; }
+        body.dark-mode .form-control { background: #2a2a3e; color: #eee; border-color: #555; }
+        .empty-state { text-align: center; padding: 40px 0; }
+        .empty-state i { font-size: 3rem; color: #adb5bd; }
+        .empty-state p { font-size: 1.2rem; color: #6c757d; }
+        @media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+    </style>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" media="print" onload="this.media='all'">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
     <link href="https://unpkg.com/aos@2.3.1/dist/aos.css" rel="stylesheet">
@@ -291,44 +512,12 @@ BASE_TEMPLATE = '''
       "foundingDate": "{{ ESTABLISHED }}"
     }
     </script>
-    <style>
-        :root { --bg: #f0f4f8; --card-bg: rgba(255,255,255,0.85); --text: #1a1a2e; --primary: #0d6efd; --shadow: 0 8px 32px rgba(0,0,0,0.1); }
-        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); transition: background 0.3s, color 0.3s; }
-        body.dark-mode { --bg: #1a1a2e; --card-bg: rgba(30,30,50,0.85); --text: #f0f4f8; }
-        .glass { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.2); box-shadow: var(--shadow); border-radius: 1rem; }
-        .navbar-brand img { height: 50px; width: auto; }
-        .hero { background: linear-gradient(135deg, #0d6efd, #0a58ca); color: white; padding: 80px 0; margin-bottom: 30px; position: relative; overflow: hidden; min-height: 350px; }
-        .hero-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-size: cover; background-position: center; opacity: 0.25; z-index: 0; }
-        .hero .container { position: relative; z-index: 1; }
-        .hero h1 { font-size: 3.5rem; font-weight: 700; text-shadow: 2px 2px 8px rgba(0,0,0,0.3); }
-        .hero .lead { font-size: 1.5rem; text-shadow: 1px 1px 4px rgba(0,0,0,0.3); }
-        .card-hover { transition: transform 0.3s ease, box-shadow 0.3s ease; }
-        .card-hover:hover { transform: translateY(-5px); box-shadow: 0 10px 20px rgba(0,0,0,0.15); }
-        .quote-container { background: rgba(255,255,255,0.85); backdrop-filter: blur(8px); border-radius: 15px; padding: 30px; text-align: center; color: #1a1a1a; border: 1px solid rgba(0,0,0,0.1); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-        .quote-container blockquote { font-size: 1.4rem; font-style: italic; border-left: 4px solid #ffc107; padding-left: 20px; color: #1a1a1a; }
-        .quote-container footer { background: transparent; color: #333; padding: 10px 0 0; }
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        .chat-box { height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 15px; background: #f9f9f9; border-radius: 8px; }
-        .chat-msg { margin-bottom: 10px; }
-        .chat-msg .user { font-weight: bold; }
-        .chat-msg .time { font-size: 0.8rem; color: #888; }
-        .chat-msg.self { background: #d1ecf1; padding: 5px 10px; border-radius: 10px; }
-        .chat-msg.other { background: #f8d7da; padding: 5px 10px; border-radius: 10px; }
-        .counter { font-size: 3rem; font-weight: 700; color: #ffc107; text-shadow: 2px 2px 4px rgba(0,0,0,0.2); }
-        .counter-label { color: #f8f9fa; font-weight: 500; }
-        .btn-toggle-dark { background: none; border: none; font-size: 1.5rem; color: white; cursor: pointer; }
-        @media (max-width: 768px) { .hero h1 { font-size: 2.5rem; } .hero .lead { font-size: 1.2rem; } .counter { font-size: 2rem; } }
-        .text-muted { color: #6c757d !important; }
-        a { color: #0d6efd; }
-        a:hover { color: #0a58ca; }
-        a:focus-visible, button:focus-visible, input:focus-visible { outline: 3px solid #0d6efd; outline-offset: 2px; }
-    </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top">
         <div class="container">
             <a class="navbar-brand" href="{{ url_for('home') }}">
-                <img src="{{ SCHOOL_LOGO }}" alt="{{ SCHOOL_NAME }} Logo" height="50" width="50">
+                <img src="{{ SCHOOL_LOGO }}" alt="{{ SCHOOL_NAME }} Logo" height="50" width="50" loading="lazy">
                 {{ SCHOOL_NAME }}
             </a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarMain" aria-label="Toggle navigation">
@@ -336,34 +525,44 @@ BASE_TEMPLATE = '''
             </button>
             <div class="collapse navbar-collapse" id="navbarMain">
                 <ul class="navbar-nav ms-auto">
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('home') }}">Home</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('about') }}">About</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('academics') }}">Academics</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('student_life') }}">Student Life</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('admissions') }}">Admissions</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('news_list') }}">News</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('gallery') }}">Gallery</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('contact') }}">Contact</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('classroom') }}">Classrooms</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('home') %}active{% endif %}" href="{{ url_for('home') }}" data-aos="fade-down">{{ _('home') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('about') %}active{% endif %}" href="{{ url_for('about') }}" data-aos="fade-down">{{ _('about') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('academics') %}active{% endif %}" href="{{ url_for('academics') }}" data-aos="fade-down">{{ _('academics') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('student_life') %}active{% endif %}" href="{{ url_for('student_life') }}" data-aos="fade-down">{{ _('student_life') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('admissions') %}active{% endif %}" href="{{ url_for('admissions') }}" data-aos="fade-down">{{ _('admissions') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('news_list') %}active{% endif %}" href="{{ url_for('news_list') }}" data-aos="fade-down">{{ _('news') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('gallery') %}active{% endif %}" href="{{ url_for('gallery') }}" data-aos="fade-down">{{ _('gallery') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('contact') %}active{% endif %}" href="{{ url_for('contact') }}" data-aos="fade-down">{{ _('contact') }}</a></li>
+                    <li class="nav-item"><a class="nav-link {% if request.path == url_for('classroom') %}active{% endif %}" href="{{ url_for('classroom') }}" data-aos="fade-down">{{ _('classrooms') }}</a></li>
                     {% if session.user_id %}
                         <li class="nav-item dropdown">
                             <a class="nav-link dropdown-toggle" href="#" id="userDropdown" role="button" data-bs-toggle="dropdown" aria-expanded="false">
                                 {{ session.full_name }}
                             </a>
-                            <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
-                                <li><a class="dropdown-item" href="{{ url_for('dashboard') }}">Dashboard</a></li>
-                                <li><a class="dropdown-item" href="{{ url_for('chat') }}">Chat</a></li>
+                            <ul class="dropdown-menu dropdown-menu-end">
+                                <li><a class="dropdown-item" href="{{ url_for('dashboard') }}">{{ _('dashboard') }}</a></li>
+                                <li><a class="dropdown-item" href="{{ url_for('chat') }}">{{ _('chat') }}</a></li>
                                 <li><hr class="dropdown-divider"></li>
-                                <li><a class="dropdown-item" href="{{ url_for('logout') }}">Logout</a></li>
+                                <li><a class="dropdown-item" href="{{ url_for('logout') }}">{{ _('logout') }}</a></li>
                             </ul>
                         </li>
                     {% else %}
-                        <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
+                        <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}" data-aos="fade-down">{{ _('login') }}</a></li>
                     {% endif %}
                     <li class="nav-item">
                         <button class="btn-toggle-dark" id="darkModeToggle" aria-label="Toggle dark mode">
                             <i class="bi bi-moon-fill"></i>
                         </button>
+                    </li>
+                    <li class="nav-item dropdown">
+                        <a class="nav-link dropdown-toggle" href="#" id="langDropdown" role="button" data-bs-toggle="dropdown">
+                            <i class="bi bi-globe"></i> {{ lang.upper() }}
+                        </a>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><a class="dropdown-item" href="?lang=en">English</a></li>
+                            <li><a class="dropdown-item" href="?lang=fr">Français</a></li>
+                            <li><a class="dropdown-item" href="?lang=sn">ChiShona</a></li>
+                        </ul>
                     </li>
                 </ul>
             </div>
@@ -387,7 +586,33 @@ BASE_TEMPLATE = '''
         {{ content | safe }}
     </main>
 
-    <footer class="mt-5 py-4 bg-dark text-white">
+    <!-- AI Assistant -->
+    <div class="ai-widget">
+        <button class="btn btn-primary" id="aiToggle" aria-label="AI Assistant"><i class="bi bi-robot"></i> AI Help</button>
+        <div class="ai-chat-box" id="aiChatBox">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong>AI Assistant</strong>
+                <button class="btn-close" id="aiClose" aria-label="Close"></button>
+            </div>
+            <div id="aiMessages" style="max-height:250px; overflow-y:auto; margin-bottom:10px;"></div>
+            <div class="input-group">
+                <input type="text" class="form-control" id="aiInput" placeholder="Ask me anything...">
+                <button class="btn btn-primary" id="aiSend"><i class="bi bi-send"></i></button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Developer Panel -->
+    <div class="dev-panel" id="devPanel">
+        <small><strong>Dev Console</strong></small><br>
+        <button class="btn btn-sm btn-outline-light" onclick="clearCache()">Clear Cache</button>
+        <button class="btn btn-sm btn-outline-light" onclick="runHealthCheck()">Health Check</button>
+        <span id="healthStatus"></span>
+        <br>
+        <span id="perfStats"></span>
+    </div>
+
+    <footer style="background: {{ footer_bg }}; color: #ddd; padding: 40px 0 20px;">
         <div class="container">
             <div class="row">
                 <div class="col-md-4">
@@ -396,19 +621,19 @@ BASE_TEMPLATE = '''
                     <p>{{ SCHOOL_ADDRESS }}<br>Phone: {{ SCHOOL_PHONE }}<br>Email: <a href="mailto:{{ SCHOOL_EMAIL }}" class="text-white">{{ SCHOOL_EMAIL }}</a></p>
                 </div>
                 <div class="col-md-4">
-                    <h5>Quick Links</h5>
+                    <h5>{{ _('quick_links') or 'Quick Links' }}</h5>
                     <ul class="list-unstyled">
-                        <li><a href="{{ url_for('about') }}" class="text-white">About Us</a></li>
-                        <li><a href="{{ url_for('academics') }}" class="text-white">Academics</a></li>
-                        <li><a href="{{ url_for('student_life') }}" class="text-white">Student Life</a></li>
-                        <li><a href="{{ url_for('admissions') }}" class="text-white">Admissions</a></li>
-                        <li><a href="{{ url_for('news_list') }}" class="text-white">News & Events</a></li>
-                        <li><a href="{{ url_for('gallery') }}" class="text-white">Gallery</a></li>
+                        <li><a href="{{ url_for('about') }}" class="text-white">{{ _('about') }}</a></li>
+                        <li><a href="{{ url_for('academics') }}" class="text-white">{{ _('academics') }}</a></li>
+                        <li><a href="{{ url_for('student_life') }}" class="text-white">{{ _('student_life') }}</a></li>
+                        <li><a href="{{ url_for('admissions') }}" class="text-white">{{ _('admissions') }}</a></li>
+                        <li><a href="{{ url_for('news_list') }}" class="text-white">{{ _('news') }}</a></li>
+                        <li><a href="{{ url_for('gallery') }}" class="text-white">{{ _('gallery') }}</a></li>
                     </ul>
                 </div>
                 <div class="col-md-4">
-                    <h5>Follow Us</h5>
-                    <div class="footer-social">
+                    <h5>{{ _('follow_us') or 'Follow Us' }}</h5>
+                    <div>
                         <a href="#" class="text-white me-3" aria-label="Facebook"><i class="bi bi-facebook"></i></a>
                         <a href="#" class="text-white me-3" aria-label="Twitter"><i class="bi bi-twitter-x"></i></a>
                         <a href="#" class="text-white me-3" aria-label="Instagram"><i class="bi bi-instagram"></i></a>
@@ -420,12 +645,14 @@ BASE_TEMPLATE = '''
         </div>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-    <script src="https://unpkg.com/aos@2.3.1/dist/aos.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/lightbox2/2.11.4/js/lightbox.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js" defer></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js" defer></script>
+    <script src="https://unpkg.com/aos@2.3.1/dist/aos.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lightbox2/2.11.4/js/lightbox.min.js" defer></script>
     <script>
-        AOS.init({ duration: 800, once: true });
+        var socket = io({ transports: ['polling'] });
+        AOS.init({ duration: 800, once: true, offset: 100 });
+
         document.addEventListener('DOMContentLoaded', function() {
             const toggle = document.getElementById('darkModeToggle');
             const body = document.body;
@@ -439,82 +666,255 @@ BASE_TEMPLATE = '''
                 localStorage.setItem('darkMode', isDark);
                 toggle.innerHTML = isDark ? '<i class="bi bi-sun-fill"></i>' : '<i class="bi bi-moon-fill"></i>';
             });
+
             const token = '{{ csrf_token() }}';
             document.querySelectorAll('input[name="csrf_token"]').forEach(el => el.value = token);
-        });
 
-        (function() {
-            const quotes = [
-                { text: "Education is the most powerful weapon which you can use to change the world.", author: "Nelson Mandela" },
-                { text: "The function of education is to teach one to think intensively and to think critically.", author: "Martin Luther King Jr." },
-                { text: "Education is not preparation for life; education is life itself.", author: "John Dewey" },
-                { text: "The roots of education are bitter, but the fruit is sweet.", author: "Aristotle" },
-                { text: "Live as if you were to die tomorrow. Learn as if you were to live forever.", author: "Mahatma Gandhi" }
-            ];
-            let idx = 0;
-            const quoteEl = document.getElementById('rotating-quote');
-            const authorEl = document.getElementById('rotating-author');
-            if (quoteEl && authorEl) {
-                setInterval(() => {
-                    idx = (idx + 1) % quotes.length;
-                    quoteEl.textContent = quotes[idx].text;
-                    authorEl.textContent = '— ' + quotes[idx].author;
-                }, 6000);
-            }
-        })();
+            // AI Widget
+            const aiToggle = document.getElementById('aiToggle');
+            const aiBox = document.getElementById('aiChatBox');
+            const aiInput = document.getElementById('aiInput');
+            const aiSend = document.getElementById('aiSend');
+            const aiMessages = document.getElementById('aiMessages');
+            const aiClose = document.getElementById('aiClose');
 
-        function animateCounters() {
-            const counters = document.querySelectorAll('.counter');
-            counters.forEach(counter => {
-                const target = parseInt(counter.getAttribute('data-target'));
-                if (!target) return;
-                const increment = Math.ceil(target / 80);
-                let current = 0;
-                const updateCounter = setInterval(() => {
-                    current += increment;
-                    if (current >= target) {
-                        counter.textContent = target;
-                        clearInterval(updateCounter);
-                    } else {
-                        counter.textContent = current;
+            aiToggle.addEventListener('click', function() {
+                aiBox.classList.toggle('open');
+                if (aiBox.classList.contains('open')) {
+                    if (!aiMessages.innerHTML) {
+                        aiMessages.innerHTML = '<div><em>Hi! I\'m your AI assistant. Ask me anything about the school.</em></div>';
                     }
-                }, 25);
+                    aiInput.focus();
+                }
             });
-        }
+            aiClose.addEventListener('click', function() { aiBox.classList.remove('open'); });
 
-        if ('IntersectionObserver' in window) {
-            const observer = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        animateCounters();
-                        observer.unobserve(entry.target);
+            function sendAI() {
+                const msg = aiInput.value.trim();
+                if (!msg) return;
+                aiMessages.innerHTML += '<div><strong>You:</strong> ' + msg + '</div>';
+                aiMessages.innerHTML += '<div class="text-muted"><em>AI is thinking...</em></div>';
+                const thinking = aiMessages.lastElementChild;
+                fetch('/ai/ask', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question: msg })
+                })
+                .then(res => res.json())
+                .then(data => {
+                    thinking.remove();
+                    aiMessages.innerHTML += '<div><strong>AI:</strong> ' + data.answer + '</div>';
+                    aiMessages.scrollTop = aiMessages.scrollHeight;
+                });
+                aiInput.value = '';
+                aiMessages.scrollTop = aiMessages.scrollHeight;
+            }
+
+            aiSend.addEventListener('click', sendAI);
+            aiInput.addEventListener('keypress', function(e) { if (e.key === 'Enter') sendAI(); });
+
+            // Developer panel
+            document.querySelector('footer').addEventListener('dblclick', function() {
+                document.getElementById('devPanel').classList.toggle('open');
+            });
+
+            window.clearCache = function() {
+                if (confirm('Clear local cache?')) {
+                    localStorage.clear();
+                    location.reload();
+                }
+            };
+
+            window.runHealthCheck = function() {
+                document.getElementById('healthStatus').innerHTML = 'Checking...';
+                fetch('/health')
+                    .then(res => res.json())
+                    .then(data => {
+                        document.getElementById('healthStatus').innerHTML = '✅ Status: ' + data.status;
+                        document.getElementById('perfStats').innerHTML = 'DB: ' + data.db + 'ms | Mem: ' + data.memory;
+                    })
+                    .catch(() => {
+                        document.getElementById('healthStatus').innerHTML = '❌ Error';
+                    });
+            };
+
+            // Animate counters
+            function animateCounters() {
+                document.querySelectorAll('.counter').forEach(c => {
+                    const target = parseInt(c.dataset.target);
+                    if (!target) return;
+                    let current = 0;
+                    const inc = Math.ceil(target / 80);
+                    const timer = setInterval(() => {
+                        current += inc;
+                        if (current >= target) { c.textContent = target; clearInterval(timer); }
+                        else c.textContent = current;
+                    }, 25);
+                });
+            }
+            if ('IntersectionObserver' in window) {
+                const obs = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) { animateCounters(); obs.unobserve(entry.target); }
+                    });
+                }, { threshold: 0.3 });
+                const stats = document.getElementById('stats-section');
+                if (stats) obs.observe(stats);
+            } else { animateCounters(); }
+
+            // Rotating quotes
+            (function() {
+                const quotes = [
+                    { text: "Education is the most powerful weapon which you can use to change the world.", author: "Nelson Mandela" },
+                    { text: "The function of education is to teach one to think intensively and to think critically.", author: "Martin Luther King Jr." },
+                    { text: "Education is not preparation for life; education is life itself.", author: "John Dewey" },
+                    { text: "The roots of education are bitter, but the fruit is sweet.", author: "Aristotle" },
+                    { text: "Live as if you were to die tomorrow. Learn as if you were to live forever.", author: "Mahatma Gandhi" }
+                ];
+                let idx = 0;
+                const quoteEl = document.getElementById('rotating-quote');
+                const authorEl = document.getElementById('rotating-author');
+                if (quoteEl && authorEl) {
+                    setInterval(() => {
+                        idx = (idx + 1) % quotes.length;
+                        quoteEl.textContent = quotes[idx].text;
+                        authorEl.textContent = '— ' + quotes[idx].author;
+                    }, 6000);
+                }
+            })();
+
+            // Password toggle
+            document.querySelectorAll('.toggle-password').forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                    const input = this.closest('.input-group').querySelector('input');
+                    if (input) {
+                        const type = input.getAttribute('type') === 'password' ? 'text' : 'password';
+                        input.setAttribute('type', type);
+                        this.querySelector('i').classList.toggle('bi-eye');
+                        this.querySelector('i').classList.toggle('bi-eye-slash');
                     }
                 });
-            }, { threshold: 0.3 });
-            const statsSection = document.getElementById('stats-section');
-            if (statsSection) {
-                observer.observe(statsSection);
+            });
+
+            // Scroll to top
+            const scrollBtn = document.createElement('button');
+            scrollBtn.innerHTML = '<i class="bi bi-arrow-up"></i>';
+            scrollBtn.className = 'btn btn-primary rounded-circle position-fixed';
+            scrollBtn.style.cssText = 'bottom: 100px; right: 20px; z-index: 999; display: none; width: 50px; height: 50px; border-radius: 50%;';
+            document.body.appendChild(scrollBtn);
+            window.addEventListener('scroll', function() {
+                if (window.scrollY > 300) { scrollBtn.style.display = 'block'; } else { scrollBtn.style.display = 'none'; }
+            });
+            scrollBtn.addEventListener('click', function() { window.scrollTo({ top: 0, behavior: 'smooth' }); });
+        });
+
+        // Chat socket events (group/private)
+        socket.on('group_message', function(data) {
+            var box = document.getElementById('group-chat-box');
+            if (!box) return;
+            var div = document.createElement('div');
+            div.className = 'chat-msg ' + (data.sender_id == userId ? 'self' : 'other');
+            div.dataset.msgId = data.id;
+            div.innerHTML = '<span class="user">' + data.sender_name + '</span> <span class="time">' + data.timestamp.slice(0,16) + '</span><p>' + data.message + '</p><span class="msg-status"></span>';
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+            if (data.sender_id != userId) {
+                socket.emit('mark_read', { message_id: data.id });
             }
-        } else {
-            document.addEventListener('DOMContentLoaded', animateCounters);
+        });
+
+        socket.on('private_message', function(data) {
+            var box = document.getElementById('private-chat-box');
+            if (!box) return;
+            var div = document.createElement('div');
+            div.className = 'chat-msg ' + (data.sender_id == userId ? 'self' : 'other');
+            div.dataset.msgId = data.id;
+            div.innerHTML = '<span class="user">' + data.sender_name + '</span> <span class="time">' + data.timestamp.slice(0,16) + '</span><p>' + data.message + '</p><span class="msg-status"></span>';
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+            if (data.sender_id != userId) {
+                socket.emit('mark_read', { message_id: data.id });
+            }
+        });
+
+        socket.on('message_read', function(data) {
+            var selector = '.chat-msg[data-msg-id="' + data.message_id + '"] .msg-status';
+            document.querySelectorAll(selector).forEach(function(el) {
+                el.innerHTML = '<i class="bi bi-check2-all text-primary" title="Read"></i>';
+            });
+        });
+
+        // Typing indicators
+        var typingTimeout;
+        function emitTyping(room, receiverId) {
+            socket.emit('typing', { room: room, receiver_id: receiverId });
         }
+        document.addEventListener('DOMContentLoaded', function() {
+            var groupInput = document.getElementById('group-msg');
+            if (groupInput) {
+                groupInput.addEventListener('keydown', function() {
+                    emitTyping('group', null);
+                });
+            }
+            var privateInput = document.getElementById('private-msg');
+            if (privateInput) {
+                privateInput.addEventListener('keydown', function() {
+                    emitTyping('private_admin', 1);
+                });
+            }
+            socket.on('typing', function(data) {
+                if (data.sender_id == userId) return;
+                var room = data.room;
+                var indicatorId = room === 'group' ? 'group-typing-indicator' : 'private-typing-indicator';
+                var el = document.getElementById(indicatorId);
+                if (el) {
+                    el.innerHTML = data.sender_name + ' is typing...';
+                    clearTimeout(el._timeout);
+                    el._timeout = setTimeout(function() { el.innerHTML = ''; }, 3000);
+                }
+            });
+
+            // Submit group chat
+            var groupForm = document.getElementById('group-chat-form');
+            if (groupForm) {
+                groupForm.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    var input = document.getElementById('group-msg');
+                    var msg = input.value.trim();
+                    if (msg) {
+                        socket.emit('group_message', { message: msg });
+                        input.value = '';
+                    }
+                });
+            }
+            var privateForm = document.getElementById('private-chat-form');
+            if (privateForm) {
+                privateForm.addEventListener('submit', function(e) {
+                    e.preventDefault();
+                    var input = document.getElementById('private-msg');
+                    var msg = input.value.trim();
+                    if (msg) {
+                        socket.emit('private_message', { message: msg, receiver_id: 1 });
+                        input.value = '';
+                    }
+                });
+            }
+        });
     </script>
 </body>
 </html>
 '''
-
-# ----- CONTENT TEMPLATES -----
 HOME_CONTENT = '''
 {% set bg_url = get_background_url() %}
-<section class="hero" style="{% if bg_url %}background: none;{% else %}background: linear-gradient(135deg, #0d6efd, #0a58ca);{% endif %}">
+<section class="hero" style="{% if bg_url %}background: none;{% else %}background: linear-gradient(135deg, {{ primary_color }}, #0a58ca);{% endif %}">
     {% if bg_url %}
-    <div class="hero-bg" style="background-image: url('{{ bg_url }}'); opacity: 1;"></div>
+    <div class="hero-bg" style="background-image: url('{{ bg_url }}');"></div>
     {% endif %}
     <div class="container text-center" data-aos="fade-up">
-        <h1>Welcome to {{ SCHOOL_NAME }}</h1>
+        <h1>{{ _('welcome') }} {{ SCHOOL_NAME }}</h1>
         <p class="lead">{{ SCHOOL_MOTTO }}</p>
         <p>Established {{ ESTABLISHED }}</p>
-        <a href="{{ url_for('admissions') }}" class="btn btn-warning btn-lg mt-3"><i class="bi bi-pencil-square"></i> Apply Now</a>
+        <a href="{{ url_for('admissions') }}" class="btn btn-warning btn-lg mt-3"><i class="bi bi-pencil-square"></i> {{ _('apply_now') }}</a>
     </div>
 </section>
 
@@ -567,7 +967,7 @@ HOME_CONTENT = '''
     </div>
 </section>
 
-<section class="bg-light py-5">
+<section class="bg-light py-5" style="background: {{ content_bg }};">
     <div class="container">
         <h2 class="text-center mb-4" data-aos="fade-up">Latest News</h2>
         <div class="row">
@@ -580,7 +980,7 @@ HOME_CONTENT = '''
                     <div class="card-body">
                         <h5 class="card-title">{{ article.title }}</h5>
                         <p class="card-text">{{ article.content[:100] }}...</p>
-                        <a href="{{ url_for('news_detail', id=article.id) }}" class="btn btn-outline-primary">Read More</a>
+                        <a href="{{ url_for('news_detail', id=article.id) }}" class="btn btn-outline-primary">{{ _('read_more') }}</a>
                     </div>
                     <div class="card-footer text-muted small">
                         {{ article.date_posted.strftime('%Y-%m-%d') }}
@@ -588,7 +988,10 @@ HOME_CONTENT = '''
                 </div>
             </div>
             {% else %}
-            <p class="text-center">No news yet. Check back later!</p>
+            <div class="empty-state">
+                <i class="bi bi-newspaper"></i>
+                <p>No news yet. Check back later!</p>
+            </div>
             {% endfor %}
         </div>
     </div>
@@ -597,7 +1000,7 @@ HOME_CONTENT = '''
 
 ABOUT_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">About {{ SCHOOL_NAME }}</h1>
+    <h1 data-aos="fade-right">{{ _('about') }}</h1>
     <div class="row mt-4">
         <div class="col-md-6" data-aos="fade-up">
             <p><strong>Knowledge · Integrity · Excellence</strong></p>
@@ -618,7 +1021,7 @@ ABOUT_CONTENT = '''
 
 ACADEMICS_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Academics</h1>
+    <h1 data-aos="fade-right">{{ _('academics') }}</h1>
     <p class="lead" data-aos="fade-up">Our academic programs are designed to challenge and inspire.</p>
     <div class="row mt-4">
         <div class="col-md-6" data-aos="fade-up">
@@ -655,7 +1058,7 @@ ACADEMICS_CONTENT = '''
 
 STUDENT_LIFE_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Student Life</h1>
+    <h1 data-aos="fade-right">{{ _('student_life') }}</h1>
     <p class="lead" data-aos="fade-up">Beyond academics, we offer a vibrant community that nurtures talents and builds character.</p>
     <ul class="nav nav-tabs" id="studentLifeTab" role="tablist">
         <li class="nav-item" role="presentation">
@@ -707,7 +1110,7 @@ STUDENT_LIFE_CONTENT = '''
 
 ADMISSIONS_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Admissions</h1>
+    <h1 data-aos="fade-right">{{ _('admissions') }}</h1>
     <p class="lead" data-aos="fade-up">Apply to join {{ SCHOOL_NAME }}. We welcome students of all backgrounds.</p>
     <div class="row mt-4">
         <div class="col-md-6" data-aos="fade-right">
@@ -728,7 +1131,7 @@ ADMISSIONS_CONTENT = '''
                                 <option value="Form 5">Form 5</option><option value="Form 6">Form 6</option>
                             </select>
                         </div>
-                        <button type="submit" class="btn btn-primary">Submit Application</button>
+                        <button type="submit" class="btn btn-primary">{{ _('apply_now') }}</button>
                     </form>
                 </div>
             </div>
@@ -753,7 +1156,7 @@ ADMISSIONS_CONTENT = '''
 
 NEWS_LIST_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">News & Events</h1>
+    <h1 data-aos="fade-right">{{ _('news') }}</h1>
     <div class="row mt-4">
         {% for article in news %}
         <div class="col-md-4" data-aos="fade-up" data-aos-delay="{{ loop.index * 100 }}">
@@ -764,13 +1167,16 @@ NEWS_LIST_CONTENT = '''
                 <div class="card-body">
                     <h5 class="card-title">{{ article.title }}</h5>
                     <p class="card-text">{{ article.content[:150] }}...</p>
-                    <a href="{{ url_for('news_detail', id=article.id) }}" class="btn btn-outline-primary">Read More</a>
+                    <a href="{{ url_for('news_detail', id=article.id) }}" class="btn btn-outline-primary">{{ _('read_more') }}</a>
                 </div>
                 <div class="card-footer text-muted small">{{ article.date_posted.strftime('%Y-%m-%d') }}</div>
             </div>
         </div>
         {% else %}
-        <p>No news articles yet.</p>
+        <div class="empty-state">
+            <i class="bi bi-newspaper"></i>
+            <p>No news articles yet.</p>
+        </div>
         {% endfor %}
     </div>
     {% if total_pages > 1 %}
@@ -792,7 +1198,7 @@ NEWS_DETAIL_CONTENT = '''
     <nav aria-label="breadcrumb">
         <ol class="breadcrumb">
             <li class="breadcrumb-item"><a href="{{ url_for('home') }}">Home</a></li>
-            <li class="breadcrumb-item"><a href="{{ url_for('news_list') }}">News</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('news_list') }}">{{ _('news') }}</a></li>
             <li class="breadcrumb-item active" aria-current="page">{{ article.title }}</li>
         </ol>
     </nav>
@@ -817,7 +1223,7 @@ NEWS_DETAIL_CONTENT = '''
 
 GALLERY_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Photo Gallery</h1>
+    <h1 data-aos="fade-right">{{ _('gallery') }}</h1>
     <p class="lead" data-aos="fade-up">Moments captured at {{ SCHOOL_NAME }}</p>
     <div class="row mt-4">
         {% for image in images %}
@@ -834,7 +1240,10 @@ GALLERY_CONTENT = '''
             </div>
         </div>
         {% else %}
-        <p class="text-center">No images in gallery yet.</p>
+        <div class="empty-state">
+            <i class="bi bi-camera"></i>
+            <p>No images in gallery yet.</p>
+        </div>
         {% endfor %}
     </div>
     {% if total_pages > 1 %}
@@ -853,7 +1262,7 @@ GALLERY_CONTENT = '''
 
 CONTACT_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Contact Us</h1>
+    <h1 data-aos="fade-right">{{ _('contact') }}</h1>
     <div class="row mt-4">
         <div class="col-md-6" data-aos="fade-up">
             <h5>Get in Touch</h5>
@@ -871,7 +1280,7 @@ CONTACT_CONTENT = '''
                         <div class="mb-3"><label for="name" class="form-label">Your Name</label><input type="text" class="form-control" id="name" name="name" required></div>
                         <div class="mb-3"><label for="email" class="form-label">Email</label><input type="email" class="form-control" id="email" name="email" required></div>
                         <div class="mb-3"><label for="message" class="form-label">Message</label><textarea class="form-control" id="message" name="message" rows="4" required></textarea></div>
-                        <button type="submit" class="btn btn-primary">Send</button>
+                        <button type="submit" class="btn btn-primary">{{ _('send') }}</button>
                     </form>
                 </div>
             </div>
@@ -894,7 +1303,7 @@ LOGIN_CONTENT = '''
         <div class="col-md-6" data-aos="fade-left">
             <div class="card shadow glass">
                 <div class="card-header bg-primary text-white text-center">
-                    <h4><i class="bi bi-box-arrow-in-right"></i> Login to {{ SCHOOL_SHORT }}</h4>
+                    <h4><i class="bi bi-box-arrow-in-right"></i> {{ _('login') }} to {{ SCHOOL_SHORT }}</h4>
                 </div>
                 <div class="card-body">
                     <form method="POST" action="{{ url_for('login') }}">
@@ -912,7 +1321,7 @@ LOGIN_CONTENT = '''
                                 </button>
                             </div>
                         </div>
-                        <button type="submit" class="btn btn-primary w-100"><i class="bi bi-key"></i> Login</button>
+                        <button type="submit" class="btn btn-primary w-100"><i class="bi bi-key"></i> {{ _('login') }}</button>
                     </form>
                     <p class="mt-3 text-center"><small>Contact admin if you forgot your password.</small></p>
                 </div>
@@ -921,43 +1330,57 @@ LOGIN_CONTENT = '''
     </div>
 </div>
 '''
-
 DASHBOARD_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Welcome, {{ session.full_name }}</h1>
+    <h1 data-aos="fade-right">{{ _('dashboard') }}</h1>
     <div class="row mt-4">
         <div class="col-md-3" data-aos="fade-up">
-            <div class="card text-white bg-primary mb-3"><div class="card-body"><h5 class="card-title">My Profile</h5><p class="card-text">{{ session.full_name }}<br>{{ session.role|capitalize }}</p><a href="{{ url_for('profile') }}" class="btn btn-light btn-sm">View</a></div></div>
+            <div class="card text-white bg-primary mb-3"><div class="card-body"><h5 class="card-title">{{ _('profile') }}</h5><p class="card-text">{{ session.full_name }}<br>{{ session.role|capitalize }}</p><a href="{{ url_for('profile') }}" class="btn btn-light btn-sm">{{ _('profile') }}</a></div></div>
         </div>
         {% if session.role == 'student' %}
         <div class="col-md-3" data-aos="fade-up" data-aos-delay="100">
-            <div class="card text-white bg-success mb-3"><div class="card-body"><h5 class="card-title">My Results</h5><p class="card-text">View your academic performance.</p><a href="{{ url_for('student_results') }}" class="btn btn-light btn-sm">Go</a></div></div>
+            <div class="card text-white bg-success mb-3"><div class="card-body"><h5 class="card-title">{{ _('results') }}</h5><p class="card-text">View your academic performance.</p><a href="{{ url_for('student_results') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
         <div class="col-md-3" data-aos="fade-up" data-aos-delay="200">
-            <div class="card text-white bg-warning mb-3"><div class="card-body"><h5 class="card-title">Fee Account</h5><p class="card-text">Check your fee balance and history.</p><a href="{{ url_for('student_fees') }}" class="btn btn-light btn-sm">Go</a></div></div>
+            <div class="card text-white bg-warning mb-3"><div class="card-body"><h5 class="card-title">{{ _('fees') }}</h5><p class="card-text">Check your fee balance and history.</p><a href="{{ url_for('student_fees') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        </div>
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="300">
+            <div class="card text-white bg-info mb-3"><div class="card-body"><h5 class="card-title">Attendance</h5><p class="card-text">View your attendance record.</p><a href="{{ url_for('student_attendance') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        </div>
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="400">
+            <div class="card text-white bg-secondary mb-3"><div class="card-body"><h5 class="card-title">Timetable</h5><p class="card-text">View your class timetable.</p><a href="{{ url_for('student_timetable') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
         {% endif %}
         {% if session.role == 'admin' or session.role == 'teacher' %}
-        <div class="col-md-3" data-aos="fade-up" data-aos-delay="300">
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="500">
             <div class="card text-white bg-danger mb-3"><div class="card-body"><h5 class="card-title">Admin Panel</h5><p class="card-text">Manage the school system.</p><a href="{{ url_for('admin_dashboard') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
         {% endif %}
         {% if session.role == 'admin' %}
-        <div class="col-md-3" data-aos="fade-up" data-aos-delay="400">
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="600">
             <div class="card text-white bg-secondary mb-3"><div class="card-body"><h5 class="card-title">Change Password</h5><p class="card-text">Update your password securely.</p><a href="{{ url_for('admin_change_password') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
-        <div class="col-md-3" data-aos="fade-up" data-aos-delay="500">
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="700">
             <div class="card text-white bg-info mb-3"><div class="card-body"><h5 class="card-title">Upload Logo</h5><p class="card-text">Change school logo.</p><a href="{{ url_for('admin_upload_logo') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
-        <div class="col-md-3" data-aos="fade-up" data-aos-delay="600">
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="800">
             <div class="card text-white bg-dark mb-3"><div class="card-body"><h5 class="card-title">Upload Background</h5><p class="card-text">Change site background.</p><a href="{{ url_for('admin_upload_background') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
-        {% endif %}
-        <div class="col-md-3" data-aos="fade-up" data-aos-delay="700">
-            <div class="card text-white bg-dark mb-3"><div class="card-body"><h5 class="card-title">Chat</h5><p class="card-text">Group or private messages.</p><a href="{{ url_for('chat') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="900">
+            <div class="card text-white bg-primary mb-3"><div class="card-body"><h5 class="card-title">Settings</h5><p class="card-text">Customise site appearance.</p><a href="{{ url_for('admin_settings') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
-        <div class="col-md-3" data-aos="fade-up" data-aos-delay="800">
-            <div class="card text-white bg-primary mb-3"><div class="card-body"><h5 class="card-title">Classrooms</h5><p class="card-text">Join your class chat room.</p><a href="{{ url_for('classroom') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="1000">
+            <div class="card text-white bg-warning mb-3"><div class="card-body"><h5 class="card-title">Timetable</h5><p class="card-text">Manage class timetables.</p><a href="{{ url_for('admin_timetable') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        </div>
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="1100">
+            <div class="card text-white bg-success mb-3"><div class="card-body"><h5 class="card-title">Attendance</h5><p class="card-text">Mark and view attendance.</p><a href="{{ url_for('admin_attendance') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        </div>
+        {% endif %}
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="1200">
+            <div class="card text-white bg-dark mb-3"><div class="card-body"><h5 class="card-title">{{ _('chat') }}</h5><p class="card-text">Group or private messages.</p><a href="{{ url_for('chat') }}" class="btn btn-light btn-sm">Go</a></div></div>
+        </div>
+        <div class="col-md-3" data-aos="fade-up" data-aos-delay="1300">
+            <div class="card text-white bg-primary mb-3"><div class="card-body"><h5 class="card-title">{{ _('classrooms') }}</h5><p class="card-text">Join your class chat room.</p><a href="{{ url_for('classroom') }}" class="btn btn-light btn-sm">Go</a></div></div>
         </div>
     </div>
 </div>
@@ -965,7 +1388,7 @@ DASHBOARD_CONTENT = '''
 
 STUDENT_RESULTS_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">My Results</h1>
+    <h1 data-aos="fade-right">{{ _('results') }}</h1>
     <div class="mt-4" data-aos="fade-up">
         {% if results %}
         <table class="table table-striped table-bordered">
@@ -977,7 +1400,10 @@ STUDENT_RESULTS_CONTENT = '''
             </tbody>
         </table>
         {% else %}
-        <p>No results posted yet.</p>
+        <div class="empty-state">
+            <i class="bi bi-clipboard-data"></i>
+            <p>No results posted yet.</p>
+        </div>
         {% endif %}
     </div>
 </div>
@@ -985,20 +1411,23 @@ STUDENT_RESULTS_CONTENT = '''
 
 STUDENT_FEES_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Fee Account</h1>
+    <h1 data-aos="fade-right">{{ _('fees') }}</h1>
     <div class="mt-4" data-aos="fade-up">
         <div class="alert alert-info"><strong>Current Balance:</strong> ${{ balance }}</div>
-        {% if fees %}
+        {% if transactions %}
         <table class="table table-striped">
-            <thead class="table-primary"><tr><th>Date</th><th>Description</th><th>Amount</th><th>Balance</th></tr></thead>
+            <thead class="table-primary"><tr><th>Date</th><th>Type</th><th>Description</th><th>Amount</th></tr></thead>
             <tbody>
-                {% for f in fees %}
-                <tr><td>{{ f.paid_date.strftime('%Y-%m-%d') }}</td><td>{{ f.description }}</td><td>${{ f.amount }}</td><td>${{ f.balance }}</td></tr>
+                {% for t in transactions %}
+                <tr><td>{{ t.date.strftime('%Y-%m-%d') }}</td><td>{{ t.type|capitalize }}</td><td>{{ t.description }}</td><td>${{ t.amount }}</td></tr>
                 {% endfor %}
             </tbody>
         </table>
         {% else %}
-        <p>No fee records.</p>
+        <div class="empty-state">
+            <i class="bi bi-wallet"></i>
+            <p>No fee records.</p>
+        </div>
         {% endif %}
     </div>
 </div>
@@ -1006,7 +1435,7 @@ STUDENT_FEES_CONTENT = '''
 
 PROFILE_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">My Profile</h1>
+    <h1 data-aos="fade-right">{{ _('profile') }}</h1>
     <div class="card mt-4 glass">
         <div class="card-body">
             <p><strong>Full Name:</strong> {{ user.full_name }}</p>
@@ -1024,26 +1453,38 @@ PROFILE_CONTENT = '''
 
 CHAT_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Chat</h1>
+    <h1 data-aos="fade-right">{{ _('chat') }}</h1>
     <div class="row mt-4">
         <div class="col-md-6">
             <div class="card glass">
-                <div class="card-header bg-primary text-white">Group Chat</div>
+                <div class="card-header bg-primary text-white">
+                    Group Chat
+                    <span class="badge bg-light text-dark float-end" id="group-typing-indicator"></span>
+                </div>
                 <div class="card-body">
                     <div id="group-chat-box" class="chat-box">
                         {% for msg in group_messages %}
-                        <div class="chat-msg {% if msg.sender_id == session.user_id %}self{% else %}other{% endif %}">
+                        <div class="chat-msg {% if msg.sender_id == session.user_id %}self{% else %}other{% endif %}" data-msg-id="{{ msg.id }}">
                             <span class="user">{{ msg.sender_name }}</span>
                             <span class="time">{{ msg.timestamp.strftime('%Y-%m-%d %H:%M') }}</span>
                             <p>{{ msg.message }}</p>
+                            <span class="msg-status">
+                                {% if msg.sender_id == session.user_id %}
+                                    {% if msg.read_at %}
+                                        <i class="bi bi-check2-all text-primary" title="Read"></i>
+                                    {% else %}
+                                        <i class="bi bi-check2 text-secondary" title="Sent"></i>
+                                    {% endif %}
+                                {% endif %}
+                            </span>
                         </div>
                         {% endfor %}
                     </div>
                     <form id="group-chat-form" class="mt-2">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="input-group">
-                            <input type="text" class="form-control" id="group-msg" placeholder="Type a message..." required>
-                            <button class="btn btn-primary" type="submit">Send</button>
+                            <input type="text" class="form-control" id="group-msg" placeholder="{{ _('type_message') }}" required>
+                            <button class="btn btn-primary" type="submit">{{ _('send') }}</button>
                         </div>
                     </form>
                 </div>
@@ -1051,22 +1492,34 @@ CHAT_CONTENT = '''
         </div>
         <div class="col-md-6">
             <div class="card glass">
-                <div class="card-header bg-success text-white">Private Chat with Admin</div>
+                <div class="card-header bg-success text-white">
+                    Private Chat with Admin
+                    <span class="badge bg-light text-dark float-end" id="private-typing-indicator"></span>
+                </div>
                 <div class="card-body">
                     <div id="private-chat-box" class="chat-box">
                         {% for msg in private_messages %}
-                        <div class="chat-msg {% if msg.sender_id == session.user_id %}self{% else %}other{% endif %}">
+                        <div class="chat-msg {% if msg.sender_id == session.user_id %}self{% else %}other{% endif %}" data-msg-id="{{ msg.id }}">
                             <span class="user">{{ msg.sender_name }}</span>
                             <span class="time">{{ msg.timestamp.strftime('%Y-%m-%d %H:%M') }}</span>
                             <p>{{ msg.message }}</p>
+                            <span class="msg-status">
+                                {% if msg.sender_id == session.user_id %}
+                                    {% if msg.read_at %}
+                                        <i class="bi bi-check2-all text-primary" title="Read"></i>
+                                    {% else %}
+                                        <i class="bi bi-check2 text-secondary" title="Sent"></i>
+                                    {% endif %}
+                                {% endif %}
+                            </span>
                         </div>
                         {% endfor %}
                     </div>
                     <form id="private-chat-form" class="mt-2">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="input-group">
-                            <input type="text" class="form-control" id="private-msg" placeholder="Message admin..." required>
-                            <button class="btn btn-success" type="submit">Send</button>
+                            <input type="text" class="form-control" id="private-msg" placeholder="{{ _('message_admin') }}" required>
+                            <button class="btn btn-success" type="submit">{{ _('send') }}</button>
                         </div>
                     </form>
                 </div>
@@ -1075,52 +1528,13 @@ CHAT_CONTENT = '''
     </div>
 </div>
 <script>
-    var socket = io();
     var userId = "{{ session.user_id }}";
-
-    socket.on('group_message', function(data) {
-        var box = document.getElementById('group-chat-box');
-        var div = document.createElement('div');
-        div.className = 'chat-msg ' + (data.sender_id == userId ? 'self' : 'other');
-        div.innerHTML = '<span class="user">' + data.sender_name + '</span> <span class="time">' + data.timestamp.slice(0,16) + '</span><p>' + data.message + '</p>';
-        box.appendChild(div);
-        box.scrollTop = box.scrollHeight;
-    });
-
-    socket.on('private_message', function(data) {
-        var box = document.getElementById('private-chat-box');
-        var div = document.createElement('div');
-        div.className = 'chat-msg ' + (data.sender_id == userId ? 'self' : 'other');
-        div.innerHTML = '<span class="user">' + data.sender_name + '</span> <span class="time">' + data.timestamp.slice(0,16) + '</span><p>' + data.message + '</p>';
-        box.appendChild(div);
-        box.scrollTop = box.scrollHeight;
-    });
-
-    document.getElementById('group-chat-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        var input = document.getElementById('group-msg');
-        var msg = input.value.trim();
-        if (msg) {
-            socket.emit('group_message', { message: msg });
-            input.value = '';
-        }
-    });
-
-    document.getElementById('private-chat-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        var input = document.getElementById('private-msg');
-        var msg = input.value.trim();
-        if (msg) {
-            socket.emit('private_message', { message: msg, receiver_id: 1 });
-            input.value = '';
-        }
-    });
 </script>
 '''
 
 CLASSROOM_CONTENT = '''
 <div class="container my-5">
-    <h1 data-aos="fade-right">Classroom Chats</h1>
+    <h1 data-aos="fade-right">{{ _('classrooms') }}</h1>
     <p class="lead" data-aos="fade-up">Join your class room and collaborate with teachers and classmates.</p>
     <div class="row mt-4">
         <div class="col-md-4">
@@ -1137,7 +1551,7 @@ CLASSROOM_CONTENT = '''
         </div>
         <div class="col-md-8">
             <div class="card glass">
-                <div class="card-header bg-primary text-white">Select a class above to start chatting</div>
+                <div class="card-header bg-primary text-white">{{ _('select_class') }}</div>
                 <div class="card-body">
                     <p>Choose a class from the list to join the room and chat in real‑time.</p>
                 </div>
@@ -1155,23 +1569,31 @@ CLASSROOM_ROOM_CONTENT = '''
             <div class="card glass">
                 <div class="card-header bg-primary text-white">
                     <i class="bi bi-chat-dots"></i> {{ room }} Chat Room
-                    <a href="{{ url_for('classroom') }}" class="btn btn-light btn-sm float-end">Back</a>
+                    <span class="badge bg-light text-dark float-end" id="classroom-typing-indicator"></span>
+                    <a href="{{ url_for('classroom') }}" class="btn btn-light btn-sm float-end me-2">Back</a>
                 </div>
                 <div class="card-body">
                     <div id="classroom-chat-box" class="chat-box">
                         {% for msg in messages %}
-                        <div class="chat-msg {% if msg.sender_id == session.user_id %}self{% else %}other{% endif %}">
+                        <div class="chat-msg {% if msg.sender_id == session.user_id %}self{% else %}other{% endif %}" data-msg-id="{{ msg.id }}">
                             <span class="user">{{ msg.sender_name }}</span>
                             <span class="time">{{ msg.timestamp.strftime('%Y-%m-%d %H:%M') }}</span>
                             <p>{{ msg.message }}</p>
+                            <span class="msg-status">
+                                {% if msg.sender_id == session.user_id and msg.read_at %}
+                                    <i class="bi bi-check2-all text-primary" title="Read"></i>
+                                {% elif msg.sender_id == session.user_id %}
+                                    <i class="bi bi-check2 text-secondary" title="Sent"></i>
+                                {% endif %}
+                            </span>
                         </div>
                         {% endfor %}
                     </div>
                     <form id="classroom-chat-form" class="mt-2">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="input-group">
-                            <input type="text" class="form-control" id="classroom-msg" placeholder="Type a message..." required>
-                            <button class="btn btn-primary" type="submit">Send</button>
+                            <input type="text" class="form-control" id="classroom-msg" placeholder="{{ _('type_message') }}" required>
+                            <button class="btn btn-primary" type="submit">{{ _('send') }}</button>
                         </div>
                     </form>
                 </div>
@@ -1180,37 +1602,71 @@ CLASSROOM_ROOM_CONTENT = '''
     </div>
 </div>
 <script>
-    var socket = io();
-    var userId = "{{ session.user_id }}";
     var room = "{{ room }}";
-
-    socket.emit('join_room', { room: room });
-
-    socket.on('classroom_message', function(data) {
-        if (data.room !== room) return;
-        var box = document.getElementById('classroom-chat-box');
-        var div = document.createElement('div');
-        div.className = 'chat-msg ' + (data.sender_id == userId ? 'self' : 'other');
-        div.innerHTML = '<span class="user">' + data.sender_name + '</span> <span class="time">' + data.timestamp.slice(0,16) + '</span><p>' + data.message + '</p>';
-        box.appendChild(div);
-        box.scrollTop = box.scrollHeight;
-    });
-
-    document.getElementById('classroom-chat-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        var input = document.getElementById('classroom-msg');
-        var msg = input.value.trim();
-        if (msg) {
-            socket.emit('classroom_message', { room: room, message: msg });
-            input.value = '';
-        }
-    });
+    var userId = "{{ session.user_id }}";
 </script>
 '''
 
-# ------------------------------
-# ADMIN TEMPLATES (all CRUD)
-# ------------------------------
+# ----- Student Timetable & Attendance -----
+STUDENT_TIMETABLE_CONTENT = '''
+<div class="container my-5">
+    <h1 data-aos="fade-right">My Timetable</h1>
+    <div class="card mt-4 glass">
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-bordered">
+                    <thead class="table-primary">
+                        <tr><th>Time</th><th>Monday</th><th>Tuesday</th><th>Wednesday</th><th>Thursday</th><th>Friday</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for period in range(1, 9) %}
+                        <tr>
+                            <td><strong>Period {{ period }}</strong></td>
+                            {% for day in range(5) %}
+                            <td>
+                                {% for slot in slots if slot.period == period and slot.day_of_week == day %}
+                                    <strong>{{ slot.subject_name }}</strong><br>
+                                    <small>{{ slot.teacher_name or '' }}<br>{{ slot.room or '' }}</small>
+                                {% endfor %}
+                            </td>
+                            {% endfor %}
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+'''
+
+STUDENT_ATTENDANCE_CONTENT = '''
+<div class="container my-5">
+    <h1 data-aos="fade-right">My Attendance</h1>
+    <div class="card mt-4 glass">
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-striped">
+                    <thead class="table-primary"><tr><th>Date</th><th>Status</th><th>Remarks</th></tr></thead>
+                    <tbody>
+                        {% for record in attendance %}
+                        <tr>
+                            <td>{{ record.date.strftime('%Y-%m-%d') }}</td>
+                            <td><span class="badge bg-{% if record.status == 'present' %}success{% elif record.status == 'late' %}warning{% else %}danger{% endif %}">{{ record.status|capitalize }}</span></td>
+                            <td>{{ record.remarks or '' }}</td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="3" class="text-center">No attendance records.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+'''
+
+# ----- Admin Templates (Dashboard, Settings, Logo, BG, Password) -----
 ADMIN_DASHBOARD_CONTENT = '''
 <div class="container-fluid my-4">
     <div class="row">
@@ -1229,6 +1685,10 @@ ADMIN_DASHBOARD_CONTENT = '''
                 <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_change_password') }}">Change Password</a></li>
                 <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_upload_logo') }}">Upload Logo</a></li>
                 <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_upload_background') }}">Upload Background</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_settings') }}">Site Settings</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_translations') }}">Translations</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_timetable') }}">Timetable</a></li>
+                <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_attendance') }}">Attendance</a></li>
             </ul>
         </div>
         <div class="col-md-10">
@@ -1296,6 +1756,57 @@ ADMIN_BG_CONTENT = '''
     </div>
 </div>
 '''
+
+ADMIN_SETTINGS_CONTENT = '''
+<div class="container my-5" style="max-width: 700px;">
+    <h1 data-aos="fade-right">Site Settings</h1>
+    <div class="card mt-4 glass">
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('admin_settings') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="mb-3"><label class="form-label">Primary Color (Hex)</label><input type="text" class="form-control" name="primary_color" value="{{ primary_color }}"></div>
+                <div class="mb-3"><label class="form-label">Secondary Color (Hex)</label><input type="text" class="form-control" name="secondary_color" value="{{ secondary_color }}"></div>
+                <div class="mb-3"><label class="form-label">Footer Background (Hex or CSS color)</label><input type="text" class="form-control" name="footer_bg" value="{{ footer_bg }}"></div>
+                <div class="mb-3"><label class="form-label">Content Background (CSS)</label><input type="text" class="form-control" name="content_bg" value="{{ content_bg }}"></div>
+                <div class="mb-3"><label class="form-label">Font Family</label><input type="text" class="form-control" name="font_family" value="{{ font_family }}"></div>
+                <button type="submit" class="btn btn-primary">Save Settings</button>
+                <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Cancel</a>
+            </form>
+        </div>
+    </div>
+</div>
+'''
+
+ADMIN_TRANSLATIONS_CONTENT = '''
+<div class="container my-5">
+    <h1 data-aos="fade-right">Manage Translations</h1>
+    <div class="card mt-4 glass">
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('admin_translations') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <table class="table table-striped">
+                    <thead><tr><th>Key</th><th>English</th><th>Français</th><th>ChiShona</th></tr></thead>
+                    <tbody>
+                        {% for t in translations %}
+                        <tr>
+                            <td>{{ t.key }}</td>
+                            <td><input type="text" class="form-control" name="en_{{ t.key }}" value="{{ t.en }}"></td>
+                            <td><input type="text" class="form-control" name="fr_{{ t.key }}" value="{{ t.fr or '' }}"></td>
+                            <td><input type="text" class="form-control" name="sn_{{ t.key }}" value="{{ t.sn or '' }}"></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <button type="submit" class="btn btn-primary">Save Translations</button>
+                <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Cancel</a>
+            </form>
+        </div>
+    </div>
+</div>
+'''
+
+# ----- Admin CRUD templates (Users, Classes, Subjects, Results, Fees, News, Applications, Gallery) -----
+# These follow the same pattern as the previous version; included in the final script.
 
 ADMIN_USERS_CONTENT = '''
 <div class="container my-5">
@@ -1652,14 +2163,160 @@ ADMIN_GALLERY_CONTENT = '''
 </div>
 '''
 
+# ----- Admin Timetable & Attendance -----
+ADMIN_TIMETABLE_CONTENT = '''
+<div class="container my-5">
+    <h1 data-aos="fade-right">Manage Timetables</h1>
+    <div class="card mt-4 glass">
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('admin_timetable_add') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="row g-2">
+                    <div class="col-md-2">
+                        <select class="form-select" name="class_id" required>
+                            <option value="">Class</option>
+                            {% for c in classes %}
+                            <option value="{{ c.id }}">{{ c.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <select class="form-select" name="day" required>
+                            <option value="">Day</option>
+                            <option value="0">Monday</option><option value="1">Tuesday</option>
+                            <option value="2">Wednesday</option><option value="3">Thursday</option>
+                            <option value="4">Friday</option>
+                        </select>
+                    </div>
+                    <div class="col-md-1">
+                        <input type="number" class="form-control" name="period" placeholder="Period" required>
+                    </div>
+                    <div class="col-md-2">
+                        <select class="form-select" name="subject_id" required>
+                            <option value="">Subject</option>
+                            {% for s in subjects %}
+                            <option value="{{ s.id }}">{{ s.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <select class="form-select" name="teacher_id">
+                            <option value="">Teacher</option>
+                            {% for t in teachers %}
+                            <option value="{{ t.id }}">{{ t.full_name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <input type="text" class="form-control" name="room" placeholder="Room">
+                    </div>
+                    <div class="col-md-1">
+                        <button type="submit" class="btn btn-primary">Add</button>
+                    </div>
+                </div>
+            </form>
+            <hr>
+            <div class="table-responsive">
+                <table class="table table-bordered">
+                    <thead class="table-primary">
+                        <tr><th>Class</th><th>Day</th><th>Period</th><th>Subject</th><th>Teacher</th><th>Room</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for slot in slots %}
+                        <tr>
+                            <td>{{ slot.class_name }}</td>
+                            <td>{% set days = ['Monday','Tuesday','Wednesday','Thursday','Friday'] %}{{ days[slot.day_of_week] }}</td>
+                            <td>{{ slot.period }}</td>
+                            <td>{{ slot.subject_name }}</td>
+                            <td>{{ slot.teacher_name or '-' }}</td>
+                            <td>{{ slot.room or '-' }}</td>
+                            <td>
+                                <form method="POST" action="{{ url_for('admin_timetable_delete', id=slot.id) }}" style="display:inline;" onsubmit="return confirm('Delete this slot?')">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="7" class="text-center">No timetable slots.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+'''
+
+ADMIN_ATTENDANCE_CONTENT = '''
+<div class="container my-5">
+    <h1 data-aos="fade-right">Manage Attendance</h1>
+    <div class="card mt-4 glass">
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('admin_attendance_mark') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="row g-2 mb-3">
+                    <div class="col-md-3">
+                        <select class="form-select" name="class_id" required>
+                            <option value="">Class</option>
+                            {% for c in classes %}
+                            <option value="{{ c.id }}">{{ c.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <input type="date" class="form-control" name="date" required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="submit" class="btn btn-primary">Load Students</button>
+                    </div>
+                </div>
+                <div id="attendance-list">
+                    <!-- Students will be loaded via JavaScript or displayed here -->
+                    <p class="text-muted">Select a class and date to mark attendance.</p>
+                </div>
+            </form>
+        </div>
+    </div>
+    <div class="card mt-4 glass">
+        <div class="card-header bg-primary text-white">Attendance Records</div>
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-striped">
+                    <thead class="table-primary"><tr><th>Student</th><th>Date</th><th>Status</th><th>Remarks</th></tr></thead>
+                    <tbody>
+                        {% for record in records %}
+                        <tr>
+                            <td>{{ record.student_name }}</td>
+                            <td>{{ record.date.strftime('%Y-%m-%d') }}</td>
+                            <td><span class="badge bg-{% if record.status == 'present' %}success{% elif record.status == 'late' %}warning{% else %}danger{% endif %}">{{ record.status|capitalize }}</span></td>
+                            <td>{{ record.remarks or '' }}</td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="text-center">No attendance records.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+'''
 # ------------------------------
 # Render Helper
 # ------------------------------
-def render_page(title, content_template, **kwargs):
+def render_page(title, content_template, lang='en', **kwargs):
     kwargs.setdefault('csrf_token', generate_csrf_token)
     kwargs.setdefault('get_background_url', get_background_url)
+    kwargs.setdefault('primary_color', get_cached_setting('primary_color', '#0d6efd'))
+    kwargs.setdefault('secondary_color', get_cached_setting('secondary_color', '#6c757d'))
+    kwargs.setdefault('footer_bg', get_cached_setting('footer_bg', '#1e2a3a'))
+    kwargs.setdefault('content_bg', get_cached_setting('content_bg', ''))
+    kwargs.setdefault('font_family', get_cached_setting('font_family', 'Segoe UI, system-ui, sans-serif'))
+    kwargs.setdefault('SCHOOL_LOGO', get_school_logo())
+    kwargs.setdefault('_', lambda key: get_cached_translation(key, lang))
+    kwargs.setdefault('lang', lang)
     content_rendered = render_template_string(content_template, **kwargs)
-    logo = get_school_logo()
     return render_template_string(
         BASE_TEMPLATE,
         title=title,
@@ -1671,11 +2328,17 @@ def render_page(title, content_template, **kwargs):
         SCHOOL_PHONE=SCHOOL_PHONE,
         SCHOOL_EMAIL=SCHOOL_EMAIL,
         SCHOOL_SHORT=SCHOOL_SHORT,
-        SCHOOL_LOGO=logo,
+        SCHOOL_LOGO=get_school_logo(),
+        primary_color=get_cached_setting('primary_color', '#0d6efd'),
+        secondary_color=get_cached_setting('secondary_color', '#6c757d'),
+        footer_bg=get_cached_setting('footer_bg', '#1e2a3a'),
+        font_family=get_cached_setting('font_family', 'Segoe UI, system-ui, sans-serif'),
         request=request,
         url_for=url_for,
         session=session,
-        csrf_token=generate_csrf_token
+        csrf_token=generate_csrf_token,
+        lang=lang,
+        _=lambda key: get_cached_translation(key, lang)
     )
 
 # ------------------------------
@@ -1683,23 +2346,34 @@ def render_page(title, content_template, **kwargs):
 # ------------------------------
 @app.route('/')
 def home():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     news = News.query.order_by(News.date_posted.desc()).limit(3).all()
-    return render_page('Home', HOME_CONTENT, news=news)
+    return render_page('Home', HOME_CONTENT, lang=lang, news=news)
 
 @app.route('/about')
 def about():
-    return render_page('About', ABOUT_CONTENT)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    return render_page('About', ABOUT_CONTENT, lang=lang)
 
 @app.route('/academics')
 def academics():
-    return render_page('Academics', ACADEMICS_CONTENT)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    return render_page('Academics', ACADEMICS_CONTENT, lang=lang)
 
 @app.route('/student-life')
 def student_life():
-    return render_page('Student Life', STUDENT_LIFE_CONTENT)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    return render_page('Student Life', STUDENT_LIFE_CONTENT, lang=lang)
 
 @app.route('/admissions', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
 def admissions():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -1720,45 +2394,57 @@ def admissions():
             return redirect(url_for('admissions'))
         else:
             flash('Please fill in all fields.', 'danger')
-    return render_page('Admissions', ADMISSIONS_CONTENT)
+    return render_page('Admissions', ADMISSIONS_CONTENT, lang=lang)
 
 @app.route('/news')
 def news_list():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     page = request.args.get('page', 1, type=int)
     per_page = 6
     total = News.query.count()
     total_pages = math.ceil(total / per_page)
     offset = (page - 1) * per_page
     news = News.query.order_by(News.date_posted.desc()).offset(offset).limit(per_page).all()
-    return render_page('News', NEWS_LIST_CONTENT, news=news, current_page=page, total_pages=total_pages)
+    return render_page('News', NEWS_LIST_CONTENT, lang=lang, news=news, current_page=page, total_pages=total_pages)
 
 @app.route('/news/<int:id>')
 def news_detail(id):
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     article = News.query.get_or_404(id)
-    return render_page('News Detail', NEWS_DETAIL_CONTENT, article=article)
+    return render_page('News Detail', NEWS_DETAIL_CONTENT, lang=lang, article=article)
 
 @app.route('/gallery')
 def gallery():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     page = request.args.get('page', 1, type=int)
     per_page = 9
     total = Gallery.query.count()
     total_pages = math.ceil(total / per_page)
     offset = (page - 1) * per_page
     images = Gallery.query.order_by(Gallery.uploaded_at.desc()).offset(offset).limit(per_page).all()
-    return render_page('Gallery', GALLERY_CONTENT, images=images, current_page=page, total_pages=total_pages)
+    return render_page('Gallery', GALLERY_CONTENT, lang=lang, images=images, current_page=page, total_pages=total_pages)
 
 @app.route('/contact', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
 def contact():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
             return redirect(url_for('contact'))
         flash('Your message has been sent. We will get back to you soon.', 'success')
         return redirect(url_for('contact'))
-    return render_page('Contact', CONTACT_CONTENT)
+    return render_page('Contact', CONTACT_CONTENT, lang=lang)
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
 def login():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -1777,7 +2463,7 @@ def login():
             return redirect(url_for('dashboard'))
         else:
             flash('Invalid username or password.', 'danger')
-    return render_page('Login', LOGIN_CONTENT)
+    return render_page('Login', LOGIN_CONTENT, lang=lang)
 
 @app.route('/logout')
 def logout():
@@ -1788,40 +2474,76 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    return render_page('Dashboard', DASHBOARD_CONTENT)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    return render_page('Dashboard', DASHBOARD_CONTENT, lang=lang)
 
 @app.route('/profile')
 @login_required
 def profile():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     user = User.query.get(session['user_id'])
     class_name = ''
     if user.class_id:
         cls = Class.query.get(user.class_id)
         class_name = cls.name if cls else ''
-    return render_page('Profile', PROFILE_CONTENT, user=user, class_name=class_name)
+    return render_page('Profile', PROFILE_CONTENT, lang=lang, user=user, class_name=class_name)
 
 @app.route('/student/results')
 @login_required
 def student_results():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if session['role'] != 'student':
         flash('Access denied.', 'danger')
         return redirect(url_for('dashboard'))
     results = db.session.query(Result, Subject).join(Subject, Result.subject_id == Subject.id).filter(Result.student_id == session['user_id']).all()
-    return render_page('My Results', STUDENT_RESULTS_CONTENT, results=results)
+    return render_page('My Results', STUDENT_RESULTS_CONTENT, lang=lang, results=results)
 
 @app.route('/student/fees')
 @login_required
 def student_fees():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if session['role'] != 'student':
         flash('Access denied.', 'danger')
         return redirect(url_for('dashboard'))
-    fees = Fee.query.filter_by(student_id=session['user_id']).order_by(Fee.paid_date.desc()).all()
-    balance = fees[0].balance if fees else 0
-    return render_page('My Fees', STUDENT_FEES_CONTENT, fees=fees, balance=balance)
+    transactions = FeeTransaction.query.filter_by(student_id=session['user_id']).order_by(FeeTransaction.date.desc()).all()
+    balance = compute_fee_balance(session['user_id'])
+    return render_page('My Fees', STUDENT_FEES_CONTENT, lang=lang, transactions=transactions, balance=balance)
+
+@app.route('/student/timetable')
+@login_required
+def student_timetable():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    if session['role'] != 'student':
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    user = User.query.get(session['user_id'])
+    if not user.class_id:
+        flash('You are not assigned to a class.', 'warning')
+        return redirect(url_for('dashboard'))
+    slots = db.session.query(TimetableSlot, Subject, User).join(Subject, TimetableSlot.subject_id == Subject.id).outerjoin(User, TimetableSlot.teacher_id == User.id).filter(TimetableSlot.class_id == user.class_id).all()
+    return render_page('My Timetable', STUDENT_TIMETABLE_CONTENT, lang=lang, slots=slots)
+
+@app.route('/student/attendance')
+@login_required
+def student_attendance():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    if session['role'] != 'student':
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    attendance = Attendance.query.filter_by(student_id=session['user_id']).order_by(Attendance.date.desc()).all()
+    return render_page('My Attendance', STUDENT_ATTENDANCE_CONTENT, lang=lang, attendance=attendance)
 
 @app.route('/chat')
 @login_required
 def chat():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     group_msgs = ChatMessage.query.filter_by(room='group').order_by(ChatMessage.timestamp.desc()).limit(50).all()
     group_msgs = list(reversed(group_msgs))
     private_msgs = ChatMessage.query.filter(
@@ -1829,11 +2551,13 @@ def chat():
         ((ChatMessage.sender_id == 1) & (ChatMessage.receiver_id == session['user_id']))
     ).order_by(ChatMessage.timestamp.desc()).limit(50).all()
     private_msgs = list(reversed(private_msgs))
-    return render_page('Chat', CHAT_CONTENT, group_messages=group_msgs, private_messages=private_msgs)
+    return render_page('Chat', CHAT_CONTENT, lang=lang, group_messages=group_msgs, private_messages=private_msgs)
 
 @app.route('/classroom')
 @login_required
 def classroom():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     classes = Class.query.all()
     for c in classes:
         if c.teacher_id:
@@ -1841,14 +2565,66 @@ def classroom():
             c.teacher_name = teacher.full_name if teacher else ''
         else:
             c.teacher_name = ''
-    return render_page('Classroom', CLASSROOM_CONTENT, classes=classes)
+    return render_page('Classroom', CLASSROOM_CONTENT, lang=lang, classes=classes)
 
 @app.route('/classroom/<room>')
 @login_required
 def classroom_room(room):
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     messages = ChatMessage.query.filter_by(room=room).order_by(ChatMessage.timestamp.desc()).limit(50).all()
     messages = list(reversed(messages))
-    return render_page('Classroom Room', CLASSROOM_ROOM_CONTENT, room=room, messages=messages)
+    return render_page('Classroom Room', CLASSROOM_ROOM_CONTENT, lang=lang, room=room, messages=messages)
+
+# ------------------------------
+# Routes: AI Assistant
+# ------------------------------
+@app.route('/ai/ask', methods=['POST'])
+@limiter.limit("10 per minute")
+def ai_ask():
+    data = request.get_json()
+    question = data.get('question', '')
+    if not question:
+        return jsonify({'answer': 'Please ask a question.'})
+    answer = ai_respond(question)
+    try:
+        conv = AIConversation(
+            user_id=session.get('user_id'),
+            session_id=session.get('session_id', 'anonymous'),
+            question=question,
+            answer=answer
+        )
+        db.session.add(conv)
+        db.session.commit()
+    except:
+        pass
+    return jsonify({'answer': answer})
+
+# ------------------------------
+# Routes: Health Check
+# ------------------------------
+@app.route('/health')
+def health_check():
+    import time
+    start = time.time()
+    try:
+        db.session.execute(text('SELECT 1'))
+        db_time = int((time.time() - start) * 1000)
+        status = 'ok'
+    except:
+        db_time = 0
+        status = 'error'
+    memory = 'N/A'
+    if psutil:
+        try:
+            memory = f"{psutil.virtual_memory().available // (1024 * 1024)} MB"
+        except:
+            pass
+    return jsonify({
+        'status': status,
+        'db': db_time,
+        'memory': memory
+    })
 
 # ------------------------------
 # Routes: Admin (all CRUD)
@@ -1857,18 +2633,71 @@ def classroom_room(room):
 @login_required
 @role_required('admin')
 def admin_dashboard():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     stats = {
         'students': User.query.filter_by(role='student').count(),
         'teachers': User.query.filter_by(role='teacher').count(),
         'applications': Application.query.count(),
         'news': News.query.count(),
     }
-    return render_page('Admin Dashboard', ADMIN_DASHBOARD_CONTENT, stats=stats)
+    return render_page('Admin Dashboard', ADMIN_DASHBOARD_CONTENT, lang=lang, stats=stats)
+
+@app.route('/admin/settings', methods=['GET', 'POST'])
+@login_required
+@role_required('admin')
+def admin_settings():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    if request.method == 'POST':
+        if not validate_csrf_token(request.form.get('csrf_token')):
+            flash('Invalid CSRF token.', 'danger')
+            return redirect(url_for('admin_settings'))
+        update_setting('primary_color', sanitize_html(request.form.get('primary_color', '#0d6efd')))
+        update_setting('secondary_color', sanitize_html(request.form.get('secondary_color', '#6c757d')))
+        update_setting('footer_bg', sanitize_html(request.form.get('footer_bg', '#1e2a3a')))
+        update_setting('content_bg', sanitize_html(request.form.get('content_bg', '')))
+        update_setting('font_family', sanitize_html(request.form.get('font_family', 'Segoe UI, system-ui, sans-serif')))
+        flash('Settings updated.', 'success')
+        return redirect(url_for('admin_settings'))
+    return render_page('Site Settings', ADMIN_SETTINGS_CONTENT, lang=lang,
+        primary_color=get_cached_setting('primary_color', '#0d6efd'),
+        secondary_color=get_cached_setting('secondary_color', '#6c757d'),
+        footer_bg=get_cached_setting('footer_bg', '#1e2a3a'),
+        content_bg=get_cached_setting('content_bg', ''),
+        font_family=get_cached_setting('font_family', 'Segoe UI, system-ui, sans-serif')
+    )
+
+@app.route('/admin/translations', methods=['GET', 'POST'])
+@login_required
+@role_required('admin')
+def admin_translations():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    if request.method == 'POST':
+        if not validate_csrf_token(request.form.get('csrf_token')):
+            flash('Invalid CSRF token.', 'danger')
+            return redirect(url_for('admin_translations'))
+        for key in request.form:
+            if key.startswith('en_'):
+                t_key = key[3:]
+                t = Translation.query.filter_by(key=t_key).first()
+                if t:
+                    t.en = sanitize_html(request.form.get(key, ''))
+                    t.fr = sanitize_html(request.form.get(f'fr_{t_key}', ''))
+                    t.sn = sanitize_html(request.form.get(f'sn_{t_key}', ''))
+        db.session.commit()
+        flash('Translations updated.', 'success')
+        return redirect(url_for('admin_translations'))
+    translations = Translation.query.all()
+    return render_page('Manage Translations', ADMIN_TRANSLATIONS_CONTENT, lang=lang, translations=translations)
 
 @app.route('/admin/change-password', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_change_password():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -1891,12 +2720,14 @@ def admin_change_password():
         db.session.commit()
         flash('Password changed successfully.', 'success')
         return redirect(url_for('admin_dashboard'))
-    return render_page('Change Password', ADMIN_CHANGE_PASSWORD_CONTENT)
+    return render_page('Change Password', ADMIN_CHANGE_PASSWORD_CONTENT, lang=lang)
 
 @app.route('/admin/upload-logo', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_upload_logo():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -1905,8 +2736,8 @@ def admin_upload_logo():
             flash('No file selected.', 'danger')
             return redirect(url_for('admin_upload_logo'))
         file = request.files['logo']
-        if file.filename == '' or not allowed_file(file.filename):
-            flash('Invalid file type. Please upload PNG, JPG, JPEG, GIF, or WEBP.', 'danger')
+        if file.filename == '' or not allowed_file(file.filename) or not validate_image_content(file):
+            flash('Invalid file. Please upload a valid image (PNG, JPG, JPEG, GIF, WEBP).', 'danger')
             return redirect(url_for('admin_upload_logo'))
         filename = secure_filename(file.filename)
         upload_dir = os.path.join(app.static_folder, 'uploads')
@@ -1915,16 +2746,18 @@ def admin_upload_logo():
         filepath = os.path.join(upload_dir, unique)
         file.save(filepath)
         logo_url = f"/static/uploads/{unique}"
-        update_school_logo(logo_url)
+        update_setting('logo_url', logo_url)
         flash('Logo updated successfully.', 'success')
         return redirect(url_for('admin_dashboard'))
     logo_url = get_school_logo()
-    return render_page('Upload Logo', ADMIN_LOGO_CONTENT, logo_url=logo_url)
+    return render_page('Upload Logo', ADMIN_LOGO_CONTENT, lang=lang, logo_url=logo_url)
 
 @app.route('/admin/upload-background', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_upload_background():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -1933,8 +2766,8 @@ def admin_upload_background():
             flash('No file selected.', 'danger')
             return redirect(url_for('admin_upload_background'))
         file = request.files['background']
-        if file.filename == '' or not allowed_file(file.filename):
-            flash('Invalid file type. Please upload PNG, JPG, JPEG, GIF, or WEBP.', 'danger')
+        if file.filename == '' or not allowed_file(file.filename) or not validate_image_content(file):
+            flash('Invalid file. Please upload a valid image.', 'danger')
             return redirect(url_for('admin_upload_background'))
         filename = secure_filename(file.filename)
         upload_dir = os.path.join(app.static_folder, 'uploads')
@@ -1943,24 +2776,33 @@ def admin_upload_background():
         filepath = os.path.join(upload_dir, unique)
         file.save(filepath)
         bg_url = f"/static/uploads/{unique}"
-        update_background_url(bg_url)
+        update_setting('hero_bg', bg_url)
         flash('Background image updated successfully.', 'success')
         return redirect(url_for('admin_dashboard'))
     bg_url = get_background_url()
-    return render_page('Upload Background', ADMIN_BG_CONTENT, bg_url=bg_url)
+    return render_page('Upload Background', ADMIN_BG_CONTENT, lang=lang, bg_url=bg_url)
 
 # ---------- Admin Users ----------
 @app.route('/admin/users')
 @login_required
 @role_required('admin')
 def admin_users():
-    users = User.query.all()
-    return render_page('Manage Users', ADMIN_USERS_CONTENT, users=users)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    total = User.query.count()
+    total_pages = math.ceil(total / per_page)
+    offset = (page - 1) * per_page
+    users = User.query.offset(offset).limit(per_page).all()
+    return render_page('Manage Users', ADMIN_USERS_CONTENT, lang=lang, users=users, current_page=page, total_pages=total_pages)
 
 @app.route('/admin/users/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_users_add():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -1990,12 +2832,14 @@ def admin_users_add():
             db.session.rollback()
             flash('Username or email already exists.', 'danger')
     classes = Class.query.all()
-    return render_page('Add User', ADMIN_USERS_ADD_CONTENT, classes=classes)
+    return render_page('Add User', ADMIN_USERS_ADD_CONTENT, lang=lang, classes=classes)
 
 @app.route('/admin/users/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_users_edit(id):
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     user = User.query.get_or_404(id)
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
@@ -2010,7 +2854,7 @@ def admin_users_edit(id):
         flash('User updated.', 'success')
         return redirect(url_for('admin_users'))
     classes = Class.query.all()
-    return render_page('Edit User', ADMIN_USERS_EDIT_CONTENT, user=user, classes=classes)
+    return render_page('Edit User', ADMIN_USERS_EDIT_CONTENT, lang=lang, user=user, classes=classes)
 
 @app.route('/admin/users/delete/<int:id>', methods=['POST'])
 @login_required
@@ -2030,6 +2874,8 @@ def admin_users_delete(id):
 @login_required
 @role_required('admin')
 def admin_classes():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     classes = Class.query.all()
     for c in classes:
         if c.teacher_id:
@@ -2037,12 +2883,14 @@ def admin_classes():
             c.teacher_name = teacher.full_name if teacher else ''
         else:
             c.teacher_name = ''
-    return render_page('Manage Classes', ADMIN_CLASSES_CONTENT, classes=classes)
+    return render_page('Manage Classes', ADMIN_CLASSES_CONTENT, lang=lang, classes=classes)
 
 @app.route('/admin/classes/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_classes_add():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -2059,12 +2907,14 @@ def admin_classes_add():
         flash('Class added.', 'success')
         return redirect(url_for('admin_classes'))
     teachers = User.query.filter_by(role='teacher').all()
-    return render_page('Add Class', ADMIN_CLASSES_ADD_CONTENT, teachers=teachers)
+    return render_page('Add Class', ADMIN_CLASSES_ADD_CONTENT, lang=lang, teachers=teachers)
 
 @app.route('/admin/classes/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_classes_edit(id):
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     cls = Class.query.get_or_404(id)
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
@@ -2077,7 +2927,7 @@ def admin_classes_edit(id):
         flash('Class updated.', 'success')
         return redirect(url_for('admin_classes'))
     teachers = User.query.filter_by(role='teacher').all()
-    return render_page('Edit Class', ADMIN_CLASSES_EDIT_CONTENT, cls=cls, teachers=teachers)
+    return render_page('Edit Class', ADMIN_CLASSES_EDIT_CONTENT, lang=lang, cls=cls, teachers=teachers)
 
 @app.route('/admin/classes/delete/<int:id>', methods=['POST'])
 @login_required
@@ -2097,13 +2947,17 @@ def admin_classes_delete(id):
 @login_required
 @role_required('admin')
 def admin_subjects():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     subjects = Subject.query.all()
-    return render_page('Manage Subjects', ADMIN_SUBJECTS_CONTENT, subjects=subjects)
+    return render_page('Manage Subjects', ADMIN_SUBJECTS_CONTENT, lang=lang, subjects=subjects)
 
 @app.route('/admin/subjects/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_subjects_add():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
@@ -2122,12 +2976,14 @@ def admin_subjects_add():
         except:
             db.session.rollback()
             flash('Subject code already exists.', 'danger')
-    return render_page('Add Subject', ADMIN_SUBJECTS_ADD_CONTENT)
+    return render_page('Add Subject', ADMIN_SUBJECTS_ADD_CONTENT, lang=lang)
 
 @app.route('/admin/subjects/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_subjects_edit(id):
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     subject = Subject.query.get_or_404(id)
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
@@ -2142,7 +2998,7 @@ def admin_subjects_edit(id):
         except:
             db.session.rollback()
             flash('Subject code already exists.', 'danger')
-    return render_page('Edit Subject', ADMIN_SUBJECTS_EDIT_CONTENT, subject=subject)
+    return render_page('Edit Subject', ADMIN_SUBJECTS_EDIT_CONTENT, lang=lang, subject=subject)
 
 @app.route('/admin/subjects/delete/<int:id>', methods=['POST'])
 @login_required
@@ -2162,10 +3018,17 @@ def admin_subjects_delete(id):
 @login_required
 @role_required('admin')
 def admin_results():
-    results = db.session.query(Result, User, Subject).join(User, Result.student_id == User.id).join(Subject, Result.subject_id == Subject.id).order_by(Result.year.desc(), Result.term.desc()).all()
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    total = db.session.query(Result).count()
+    total_pages = math.ceil(total / per_page)
+    offset = (page - 1) * per_page
+    results = db.session.query(Result, User, Subject).join(User, Result.student_id == User.id).join(Subject, Result.subject_id == Subject.id).order_by(Result.year.desc(), Result.term.desc()).offset(offset).limit(per_page).all()
     students = User.query.filter_by(role='student').all()
     subjects = Subject.query.all()
-    return render_page('Manage Results', ADMIN_RESULTS_CONTENT, results=results, students=students, subjects=subjects)
+    return render_page('Manage Results', ADMIN_RESULTS_CONTENT, lang=lang, results=results, students=students, subjects=subjects, current_page=page, total_pages=total_pages)
 
 @app.route('/admin/results/add', methods=['POST'])
 @login_required
@@ -2208,9 +3071,16 @@ def admin_results_delete(id):
 @login_required
 @role_required('admin')
 def admin_fees():
-    fees = db.session.query(Fee, User).join(User, Fee.student_id == User.id).order_by(Fee.paid_date.desc()).all()
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    total = db.session.query(FeeTransaction).count()
+    total_pages = math.ceil(total / per_page)
+    offset = (page - 1) * per_page
+    fees = db.session.query(FeeTransaction, User).join(User, FeeTransaction.student_id == User.id).order_by(FeeTransaction.date.desc()).offset(offset).limit(per_page).all()
     students = User.query.filter_by(role='student').all()
-    return render_page('Manage Fees', ADMIN_FEES_CONTENT, fees=fees, students=students)
+    return render_page('Manage Fees', ADMIN_FEES_CONTENT, lang=lang, fees=fees, students=students, current_page=page, total_pages=total_pages)
 
 @app.route('/admin/fees/add', methods=['POST'])
 @login_required
@@ -2221,16 +3091,18 @@ def admin_fees_add():
         return redirect(url_for('admin_fees'))
     student_id = request.form.get('student_id')
     amount = request.form.get('amount')
-    paid_date = request.form.get('paid_date')
+    date_str = request.form.get('paid_date')
     description = sanitize_html(request.form.get('description'))
-    if not all([student_id, amount, paid_date]):
+    if not all([student_id, amount, date_str]):
         flash('Student, Amount, and Date are required.', 'danger')
         return redirect(url_for('admin_fees'))
-    # Calculate new balance
-    last_fee = Fee.query.filter_by(student_id=student_id).order_by(Fee.id.desc()).first()
-    current_balance = last_fee.balance if last_fee else 0
-    new_balance = current_balance - float(amount)
-    fee = Fee(student_id=student_id, amount=amount, paid_date=datetime.datetime.strptime(paid_date, '%Y-%m-%d').date(), description=description, balance=new_balance)
+    fee = FeeTransaction(
+        student_id=student_id,
+        type='payment',  # we treat additions as payments (negative charge)
+        amount=float(amount),
+        description=description,
+        date=datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+    )
     db.session.add(fee)
     db.session.commit()
     flash('Fee record added.', 'success')
@@ -2243,7 +3115,7 @@ def admin_fees_delete(id):
     if not validate_csrf_token(request.form.get('csrf_token')):
         flash('Invalid CSRF token.', 'danger')
         return redirect(url_for('admin_fees'))
-    fee = Fee.query.get_or_404(id)
+    fee = FeeTransaction.query.get_or_404(id)
     db.session.delete(fee)
     db.session.commit()
     flash('Fee record deleted.', 'success')
@@ -2254,23 +3126,32 @@ def admin_fees_delete(id):
 @login_required
 @role_required('admin')
 def admin_news():
-    news = News.query.order_by(News.date_posted.desc()).all()
-    return render_page('Manage News', ADMIN_NEWS_CONTENT, news=news)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    page = request.args.get('page', 1, type=int)
+    per_page = 10
+    total = News.query.count()
+    total_pages = math.ceil(total / per_page)
+    offset = (page - 1) * per_page
+    news = News.query.order_by(News.date_posted.desc()).offset(offset).limit(per_page).all()
+    return render_page('Manage News', ADMIN_NEWS_CONTENT, lang=lang, news=news, current_page=page, total_pages=total_pages)
 
 @app.route('/admin/news/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_news_add():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
             return redirect(url_for('admin_news_add'))
         title = sanitize_html(request.form.get('title'))
-        content = request.form.get('content')
+        content = sanitize_html(request.form.get('content'))
         image_url = sanitize_html(request.form.get('image_url'))
         video_url = sanitize_html(request.form.get('video_url'))
         file = request.files.get('image')
-        if file and allowed_file(file.filename):
+        if file and allowed_file(file.filename) and validate_image_content(file):
             filename = secure_filename(file.filename)
             upload_dir = os.path.join(app.static_folder, 'uploads')
             os.makedirs(upload_dir, exist_ok=True)
@@ -2286,23 +3167,25 @@ def admin_news_add():
         db.session.commit()
         flash('News article added.', 'success')
         return redirect(url_for('admin_news'))
-    return render_page('Add News', ADMIN_NEWS_ADD_CONTENT)
+    return render_page('Add News', ADMIN_NEWS_ADD_CONTENT, lang=lang)
 
 @app.route('/admin/news/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
 def admin_news_edit(id):
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
     article = News.query.get_or_404(id)
     if request.method == 'POST':
         if not validate_csrf_token(request.form.get('csrf_token')):
             flash('Invalid CSRF token.', 'danger')
             return redirect(url_for('admin_news_edit', id=id))
         title = sanitize_html(request.form.get('title'))
-        content = request.form.get('content')
+        content = sanitize_html(request.form.get('content'))
         image_url = sanitize_html(request.form.get('image_url'))
         video_url = sanitize_html(request.form.get('video_url'))
         file = request.files.get('image')
-        if file and allowed_file(file.filename):
+        if file and allowed_file(file.filename) and validate_image_content(file):
             if article.image_url and article.image_url.startswith('/static/uploads/'):
                 old_path = os.path.join('.', article.image_url.lstrip('/'))
                 if os.path.exists(old_path):
@@ -2324,7 +3207,7 @@ def admin_news_edit(id):
         db.session.commit()
         flash('News updated.', 'success')
         return redirect(url_for('admin_news'))
-    return render_page('Edit News', ADMIN_NEWS_EDIT_CONTENT, article=article)
+    return render_page('Edit News', ADMIN_NEWS_EDIT_CONTENT, lang=lang, article=article)
 
 @app.route('/admin/news/delete/<int:id>', methods=['POST'])
 @login_required
@@ -2348,16 +3231,30 @@ def admin_news_delete(id):
 @login_required
 @role_required('admin')
 def admin_applications():
-    apps = Application.query.order_by(Application.date_applied.desc()).all()
-    return render_page('Manage Applications', ADMIN_APPLICATIONS_CONTENT, apps=apps)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    total = Application.query.count()
+    total_pages = math.ceil(total / per_page)
+    offset = (page - 1) * per_page
+    apps = Application.query.order_by(Application.date_applied.desc()).offset(offset).limit(per_page).all()
+    return render_page('Manage Applications', ADMIN_APPLICATIONS_CONTENT, lang=lang, apps=apps, current_page=page, total_pages=total_pages)
 
 # ---------- Admin Gallery ----------
 @app.route('/admin/gallery')
 @login_required
 @role_required('admin')
 def admin_gallery():
-    images = Gallery.query.order_by(Gallery.uploaded_at.desc()).all()
-    return render_page('Manage Gallery', ADMIN_GALLERY_CONTENT, images=images)
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    page = request.args.get('page', 1, type=int)
+    per_page = 12
+    total = Gallery.query.count()
+    total_pages = math.ceil(total / per_page)
+    offset = (page - 1) * per_page
+    images = Gallery.query.order_by(Gallery.uploaded_at.desc()).offset(offset).limit(per_page).all()
+    return render_page('Manage Gallery', ADMIN_GALLERY_CONTENT, lang=lang, images=images, current_page=page, total_pages=total_pages)
 
 @app.route('/admin/gallery/add', methods=['POST'])
 @login_required
@@ -2370,7 +3267,7 @@ def admin_gallery_add():
         flash('No image file provided.', 'danger')
         return redirect(url_for('admin_gallery'))
     file = request.files['image']
-    if file.filename == '' or not allowed_file(file.filename):
+    if file.filename == '' or not allowed_file(file.filename) or not validate_image_content(file):
         flash('Invalid file type. Please upload PNG, JPG, JPEG, GIF, or WEBP.', 'danger')
         return redirect(url_for('admin_gallery'))
     filename = secure_filename(file.filename)
@@ -2405,6 +3302,122 @@ def admin_gallery_delete(id):
     flash('Image deleted.', 'success')
     return redirect(url_for('admin_gallery'))
 
+# ---------- Admin Timetable ----------
+@app.route('/admin/timetable')
+@login_required
+@role_required('admin')
+def admin_timetable():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    slots = db.session.query(TimetableSlot, Class, Subject, User).join(Class, TimetableSlot.class_id == Class.id).join(Subject, TimetableSlot.subject_id == Subject.id).outerjoin(User, TimetableSlot.teacher_id == User.id).all()
+    classes = Class.query.all()
+    subjects = Subject.query.all()
+    teachers = User.query.filter_by(role='teacher').all()
+    # Build slot objects with class_name, subject_name, teacher_name
+    slot_data = []
+    for slot, cls, subj, user in slots:
+        slot.class_name = cls.name
+        slot.subject_name = subj.name
+        slot.teacher_name = user.full_name if user else None
+        slot_data.append(slot)
+    return render_page('Manage Timetable', ADMIN_TIMETABLE_CONTENT, lang=lang, slots=slot_data, classes=classes, subjects=subjects, teachers=teachers)
+
+@app.route('/admin/timetable/add', methods=['POST'])
+@login_required
+@role_required('admin')
+def admin_timetable_add():
+    if not validate_csrf_token(request.form.get('csrf_token')):
+        flash('Invalid CSRF token.', 'danger')
+        return redirect(url_for('admin_timetable'))
+    class_id = request.form.get('class_id')
+    day = request.form.get('day')
+    period = request.form.get('period')
+    subject_id = request.form.get('subject_id')
+    teacher_id = request.form.get('teacher_id')
+    room = request.form.get('room')
+    if not all([class_id, day, period, subject_id]):
+        flash('Class, Day, Period, and Subject are required.', 'danger')
+        return redirect(url_for('admin_timetable'))
+    slot = TimetableSlot(
+        class_id=class_id,
+        day_of_week=int(day),
+        period=int(period),
+        subject_id=subject_id,
+        teacher_id=teacher_id or None,
+        room=room
+    )
+    db.session.add(slot)
+    db.session.commit()
+    flash('Timetable slot added.', 'success')
+    return redirect(url_for('admin_timetable'))
+
+@app.route('/admin/timetable/delete/<int:id>', methods=['POST'])
+@login_required
+@role_required('admin')
+def admin_timetable_delete(id):
+    if not validate_csrf_token(request.form.get('csrf_token')):
+        flash('Invalid CSRF token.', 'danger')
+        return redirect(url_for('admin_timetable'))
+    slot = TimetableSlot.query.get_or_404(id)
+    db.session.delete(slot)
+    db.session.commit()
+    flash('Slot deleted.', 'success')
+    return redirect(url_for('admin_timetable'))
+
+# ---------- Admin Attendance ----------
+@app.route('/admin/attendance')
+@login_required
+@role_required('admin')
+def admin_attendance():
+    lang = request.args.get('lang', session.get('lang', 'en'))
+    session['lang'] = lang
+    classes = Class.query.all()
+    records = db.session.query(Attendance, User).join(User, Attendance.student_id == User.id).order_by(Attendance.date.desc()).limit(100).all()
+    # Build record objects with student_name
+    record_data = []
+    for att, user in records:
+        att.student_name = user.full_name
+        record_data.append(att)
+    return render_page('Manage Attendance', ADMIN_ATTENDANCE_CONTENT, lang=lang, classes=classes, records=record_data)
+
+@app.route('/admin/attendance/mark', methods=['POST'])
+@login_required
+@role_required('admin')
+def admin_attendance_mark():
+    if not validate_csrf_token(request.form.get('csrf_token')):
+        flash('Invalid CSRF token.', 'danger')
+        return redirect(url_for('admin_attendance'))
+    class_id = request.form.get('class_id')
+    date_str = request.form.get('date')
+    if not class_id or not date_str:
+        flash('Class and date are required.', 'danger')
+        return redirect(url_for('admin_attendance'))
+    date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+    students = User.query.filter_by(class_id=class_id, role='student').all()
+    for student in students:
+        status = request.form.get(f'status_{student.id}')
+        remarks = request.form.get(f'remarks_{student.id}')
+        if status:
+            # Check if attendance already exists for this student/date
+            att = Attendance.query.filter_by(student_id=student.id, date=date_obj).first()
+            if att:
+                att.status = status
+                att.remarks = remarks
+                att.teacher_id = session['user_id']
+            else:
+                att = Attendance(
+                    student_id=student.id,
+                    class_id=class_id,
+                    date=date_obj,
+                    status=status,
+                    remarks=remarks,
+                    teacher_id=session['user_id']
+                )
+                db.session.add(att)
+    db.session.commit()
+    flash('Attendance marked successfully.', 'success')
+    return redirect(url_for('admin_attendance'))
+
 # ------------------------------
 # Serve static files
 # ------------------------------
@@ -2426,10 +3439,11 @@ def handle_group_message(data):
     db.session.add(chat)
     db.session.commit()
     emit('group_message', {
+        'id': chat.id,
         'sender_id': session['user_id'],
         'sender_name': session['full_name'],
         'message': msg,
-        'timestamp': datetime.datetime.utcnow().isoformat()
+        'timestamp': chat.timestamp.isoformat()
     }, broadcast=True)
 
 @socketio.on('private_message')
@@ -2443,20 +3457,15 @@ def handle_private_message(data):
     chat = ChatMessage(sender_id=session['user_id'], receiver_id=receiver_id, room='private_admin', message=msg)
     db.session.add(chat)
     db.session.commit()
-    # Send to sender
-    emit('private_message', {
+    payload = {
+        'id': chat.id,
         'sender_id': session['user_id'],
         'sender_name': session['full_name'],
         'message': msg,
-        'timestamp': datetime.datetime.utcnow().isoformat()
-    }, room=str(session['user_id']))
-    # Send to receiver
-    emit('private_message', {
-        'sender_id': session['user_id'],
-        'sender_name': session['full_name'],
-        'message': msg,
-        'timestamp': datetime.datetime.utcnow().isoformat()
-    }, room=str(receiver_id))
+        'timestamp': chat.timestamp.isoformat()
+    }
+    emit('private_message', payload, room=str(session['user_id']))
+    emit('private_message', payload, room=str(receiver_id))
 
 @socketio.on('classroom_message')
 def handle_classroom_message(data):
@@ -2469,34 +3478,63 @@ def handle_classroom_message(data):
     chat = ChatMessage(sender_id=session['user_id'], room=room, message=msg)
     db.session.add(chat)
     db.session.commit()
-    emit('classroom_message', {
+    payload = {
+        'id': chat.id,
         'sender_id': session['user_id'],
         'sender_name': session['full_name'],
         'room': room,
         'message': msg,
-        'timestamp': datetime.datetime.utcnow().isoformat()
-    }, room=room)
+        'timestamp': chat.timestamp.isoformat()
+    }
+    emit('classroom_message', payload, room=room)
 
-@socketio.on('join_room')
-def on_join(data):
+@socketio.on('typing')
+def handle_typing(data):
+    if 'user_id' not in session:
+        return
     room = data.get('room')
+    receiver_id = data.get('receiver_id')
     if room:
-        join_room(room)
+        emit('typing', {
+            'sender_id': session['user_id'],
+            'sender_name': session['full_name'],
+            'room': room,
+            'receiver_id': receiver_id
+        }, room=room if room != 'group' else None, broadcast=(room == 'group' or room is None))
+    elif receiver_id:
+        emit('typing', {
+            'sender_id': session['user_id'],
+            'sender_name': session['full_name'],
+            'room': 'private_admin',
+            'receiver_id': receiver_id
+        }, room=str(session['user_id']))
+        emit('typing', {
+            'sender_id': session['user_id'],
+            'sender_name': session['full_name'],
+            'room': 'private_admin',
+            'receiver_id': receiver_id
+        }, room=str(receiver_id))
 
-@socketio.on('connect')
-def on_connect():
-    if 'user_id' in session:
-        join_room(str(session['user_id']))
-
-@socketio.on('disconnect')
-def on_disconnect():
-    if 'user_id' in session:
-        leave_room(str(session['user_id']))
+@socketio.on('mark_read')
+def handle_mark_read(data):
+    if 'user_id' not in session:
+        return
+    msg_id = data.get('message_id')
+    if not msg_id:
+        return
+    chat = ChatMessage.query.get(msg_id)
+    if chat and chat.receiver_id == session['user_id']:
+        chat.read_at = datetime.datetime.utcnow()
+        db.session.commit()
+        emit('message_read', {'message_id': msg_id}, room=str(chat.sender_id))
 
 # ------------------------------
 # Run Application
 # ------------------------------
 if __name__ == '__main__':
+    os.makedirs('static/uploads', exist_ok=True)
+    os.makedirs('static/gallery', exist_ok=True)
     socketio.run(app, host='0.0.0.0', port=5000)
+    
     
     
