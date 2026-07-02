@@ -3,15 +3,19 @@
 
 """
 IKM High School - Complete School Management System
-FINAL PRODUCTION VERSION - ALL FEATURES, ALL TEMPLATES, ALL ROUTES.
+PRODUCTION VERSION - Windows Compatible, All Features, Fixed CSP, Fee Logic, Error Handling
 """
 
+# =============================================================================
+# IMPORTS
+# =============================================================================
 import os
 import datetime
 import math
 import secrets
 import time
 import re
+import logging
 from functools import wraps
 from flask import (
     Flask, render_template_string, request, redirect, url_for,
@@ -20,6 +24,7 @@ from flask import (
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text, Index
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from markupsafe import escape
@@ -30,9 +35,15 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
 
-# ------------------------------
-# Configuration
-# ------------------------------
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# APP CONFIGURATION
+# =============================================================================
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
@@ -49,27 +60,49 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['PREFERRED_URL_SCHEME'] = 'https'
 
-Talisman(app, content_security_policy={
-    'default-src': ["'self'"],
-    'script-src': ["'self'", 'https://cdn.jsdelivr.net', 'https://cdn.socket.io', 'https://unpkg.com'],
-    'style-src': ["'self'", 'https://cdn.jsdelivr.net', 'https://unpkg.com'],
-    'img-src': ["'self'", 'data:', 'https://images.unsplash.com', 'https://i.imgur.com'],
-    'font-src': ["'self'", 'https://cdn.jsdelivr.net'],
-    'connect-src': ["'self'", 'ws://localhost:5000'],
-    'frame-src': ["'self'", 'https://www.youtube.com'],
-}, force_https=True, force_https_permanent=True)
+# ---- CSP with per‑request nonce ----
+def generate_nonce():
+    return secrets.token_urlsafe(16)
 
+@app.context_processor
+def inject_nonce():
+    return {'nonce': generate_nonce()}
+
+csp = {
+    'default-src': ["'self'"],
+    'script-src': ["'self'", "https://cdn.jsdelivr.net", "https://cdn.socket.io", "https://unpkg.com"],
+    'style-src': ["'self'", "https://cdn.jsdelivr.net", "https://unpkg.com"],
+    'img-src': ["'self'", "data:", "https://images.unsplash.com", "https://i.imgur.com"],
+    'font-src': ["'self'", "https://cdn.jsdelivr.net"],
+    'connect-src': ["'self'", "ws://localhost:5000"],
+    'frame-src': ["'self'", "https://www.youtube.com"],
+}
+
+@app.before_request
+def set_nonce():
+    g.nonce = generate_nonce()
+    nonce_src = f"'nonce-{g.nonce}'"
+    csp['script-src'] = [src for src in csp['script-src'] if not src.startswith("'nonce-")] + [nonce_src]
+    csp['style-src'] = [src for src in csp['style-src'] if not src.startswith("'nonce-")] + [nonce_src]
+
+Talisman(app, content_security_policy=csp, force_https=True, force_https_permanent=True)
+
+# ---- Rate Limiter ----
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://",
+    storage_uri="memory://",  # use Redis in production
 )
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', transports=['polling'])
+# ---- SocketIO (threading mode – Windows compatible) ----
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', transports=['polling'])
 
 db = SQLAlchemy(app)
 
+# =============================================================================
+# SCHOOL CONSTANTS
+# =============================================================================
 SCHOOL_NAME = "IKM High School"
 SCHOOL_SHORT = "IKM"
 SCHOOL_LOGO = "https://i.imgur.com/Vdrn2CCh.jpg"
@@ -79,9 +112,9 @@ SCHOOL_EMAIL = "info@ikmhigh.ac.zw"
 SCHOOL_MOTTO = "Knowledge · Integrity · Excellence"
 ESTABLISHED = "2024"
 
-# ------------------------------
-# Database Models (all)
-# ------------------------------
+# =============================================================================
+# DATABASE MODELS
+# =============================================================================
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -189,7 +222,7 @@ class AIConversation(db.Model):
 class TimetableSlot(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     class_id = db.Column(db.Integer, db.ForeignKey('class.id'), nullable=False)
-    day_of_week = db.Column(db.Integer, nullable=False)
+    day_of_week = db.Column(db.Integer, nullable=False)  # 0=Mon .. 4=Fri
     period = db.Column(db.Integer, nullable=False)
     subject_id = db.Column(db.Integer, db.ForeignKey('subject.id'), nullable=False)
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
@@ -204,9 +237,10 @@ class Attendance(db.Model):
     remarks = db.Column(db.String(200))
     teacher_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     __table_args__ = (Index('idx_attendance_student_date', 'student_id', 'date'),)
-    # ------------------------------
-# Database Initialisation
-# ------------------------------
+
+# =============================================================================
+# DATABASE UPGRADE & INITIALISATION
+# =============================================================================
 def upgrade_columns():
     with app.app_context():
         inspector = inspect(db.engine)
@@ -283,33 +317,9 @@ with app.app_context():
             db.session.add(t)
     db.session.commit()
 
-# ------------------------------
-# Caching
-# ------------------------------
-_cache_settings = {}
-_cache_translations = {}
-_cache_timeout = 300
-
-def get_cached_setting(key, default=''):
-    if key in _cache_settings and time.time() - _cache_settings.get(key+'_time', 0) < _cache_timeout:
-        return _cache_settings[key]
-    val = get_setting(key, default)
-    _cache_settings[key] = val
-    _cache_settings[key+'_time'] = time.time()
-    return val
-
-def get_cached_translation(key, lang='en'):
-    cache_key = f"{key}_{lang}"
-    if cache_key in _cache_translations and time.time() - _cache_translations.get(cache_key+'_time', 0) < _cache_timeout:
-        return _cache_translations[cache_key]
-    val = get_translation(key, lang)
-    _cache_translations[cache_key] = val
-    _cache_translations[cache_key+'_time'] = time.time()
-    return val
-
-# ------------------------------
-# Helpers
-# ------------------------------
+# =============================================================================
+# HELPERS
+# =============================================================================
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -330,13 +340,24 @@ def role_required(role):
         return decorated
     return decorator
 
+def csrf_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method in ('POST', 'PUT', 'DELETE'):
+            token = request.form.get('csrf_token') or request.headers.get('X-CSRFToken')
+            if not token or token != session.get('csrf_token'):
+                flash('Invalid CSRF token.', 'danger')
+                return redirect(url_for('home'))
+        return f(*args, **kwargs)
+    return decorated
+
 def generate_csrf_token():
     if 'csrf_token' not in session:
         session['csrf_token'] = secrets.token_hex(16)
     return session['csrf_token']
 
 def validate_csrf_token(token):
-    return token == session.get('csrf_token')
+    return token and token == session.get('csrf_token')
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
@@ -377,8 +398,6 @@ def update_setting(key, value):
     else:
         db.session.add(SiteSetting(key=key, value=value))
     db.session.commit()
-    _cache_settings.pop(key, None)
-    _cache_settings.pop(key+'_time', None)
 
 def get_translation(key, lang='en'):
     t = Translation.query.filter_by(key=key).first()
@@ -392,10 +411,37 @@ def get_translation(key, lang='en'):
     return key
 
 def get_school_logo():
-    return get_cached_setting('logo_url', SCHOOL_LOGO)
+    return get_setting('logo_url', SCHOOL_LOGO)
 
 def get_background_url():
-    return get_cached_setting('hero_bg', '')
+    return get_setting('hero_bg', '')
+
+def add_fee_charge(student_id, amount, description, date):
+    fee = FeeTransaction(
+        student_id=student_id,
+        type='charge',
+        amount=amount,
+        description=description,
+        date=date
+    )
+    db.session.add(fee)
+    db.session.commit()
+
+def add_fee_payment(student_id, amount, description, date):
+    fee = FeeTransaction(
+        student_id=student_id,
+        type='payment',
+        amount=amount,
+        description=description,
+        date=date
+    )
+    db.session.add(fee)
+    db.session.commit()
+
+def compute_fee_balance(student_id):
+    charges = db.session.query(db.func.sum(FeeTransaction.amount)).filter_by(student_id=student_id, type='charge').scalar() or 0
+    payments = db.session.query(db.func.sum(FeeTransaction.amount)).filter_by(student_id=student_id, type='payment').scalar() or 0
+    return charges - payments
 
 def ai_respond(question):
     q = question.lower().strip()
@@ -416,13 +462,11 @@ def ai_respond(question):
             return responses[key]
     return responses['default']
 
-def compute_fee_balance(student_id):
-    charges = db.session.query(db.func.sum(FeeTransaction.amount)).filter_by(student_id=student_id, type='charge').scalar() or 0
-    payments = db.session.query(db.func.sum(FeeTransaction.amount)).filter_by(student_id=student_id, type='payment').scalar() or 0
-    return charges - payments
-    # ------------------------------
-# Templates (embedded)
-# ------------------------------
+# =============================================================================
+# TEMPLATES (embedded as strings)
+# =============================================================================
+
+# ---- BASE TEMPLATE ----
 BASE_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="{{ lang or 'en' }}">
@@ -436,11 +480,12 @@ BASE_TEMPLATE = '''
     <link rel="canonical" href="{{ request.url }}">
     <link rel="preconnect" href="https://cdn.jsdelivr.net">
     <link rel="preconnect" href="https://unpkg.com">
-    <link rel="preconnect" href="https://cdnjs.cloudflare.com">
-    <style>
+    <style nonce="{{ g.nonce }}">
         :root { --primary: {{ primary_color }}; --secondary: {{ secondary_color }}; --font: {{ font_family }}; --primary-rgb: 13, 110, 253; }
         body { font-family: var(--font); background: #f0f4f8; color: #1a1a2e; transition: background 0.3s, color 0.3s; }
         body.dark-mode { background: #1a1a2e; color: #f0f4f8; }
+        .skip-link { position: absolute; top: -100px; left: 0; padding: 10px; background: #fff; color: #000; z-index: 1000; }
+        .skip-link:focus { top: 0; }
         .navbar-brand img { height: 50px; width: auto; }
         .hero { background: linear-gradient(135deg, var(--primary), #0a58ca); color: white; padding: 60px 0; margin-bottom: 30px; position: relative; overflow: hidden; min-height: 300px; }
         .hero-bg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background-size: cover; background-position: center; }
@@ -459,9 +504,9 @@ BASE_TEMPLATE = '''
         .counter { font-size: 3rem; font-weight: 700; color: #ffc107; text-shadow: 2px 2px 4px rgba(0,0,0,0.2); }
         .counter-label { color: #f8f9fa; font-weight: 500; }
         .btn-toggle-dark { background: none; border: none; font-size: 1.5rem; color: white; cursor: pointer; }
-        .glass { background: rgba(255, 255, 255, 0.9); background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px); border-radius: 1rem; box-shadow: 0 8px 32px rgba(0,0,0,0.1); }
+        .glass { background: rgba(255, 255, 255, 0.9); backdrop-filter: blur(8px); border-radius: 1rem; box-shadow: 0 8px 32px rgba(0,0,0,0.1); }
         @media (max-width: 768px) { .hero h1 { font-size: 2rem; } .counter { font-size: 2rem; } }
-        a:focus-visible, button:focus-visible, input:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+        :focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
         .ai-widget { position: fixed; bottom: 20px; right: 20px; z-index: 999; }
         .ai-widget .btn { border-radius: 50px; padding: 12px 24px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
         .ai-chat-box { display: none; width: 320px; max-height: 400px; overflow-y: auto; background: white; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); padding: 16px; position: fixed; bottom: 80px; right: 20px; z-index: 1000; }
@@ -495,6 +540,7 @@ BASE_TEMPLATE = '''
         .empty-state i { font-size: 3rem; color: #adb5bd; }
         .empty-state p { font-size: 1.2rem; color: #6c757d; }
         @media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+        .table-responsive { overflow-x: auto; }
     </style>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" media="print" onload="this.media='all'">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
@@ -514,7 +560,8 @@ BASE_TEMPLATE = '''
     </script>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top" aria-label="Main navigation">
         <div class="container">
             <a class="navbar-brand" href="{{ url_for('home') }}">
                 <img src="{{ SCHOOL_LOGO }}" alt="{{ SCHOOL_NAME }} Logo" height="50" width="50" loading="lazy">
@@ -582,7 +629,7 @@ BASE_TEMPLATE = '''
         {% endwith %}
     </div>
 
-    <main>
+    <main id="main-content">
         {{ content | safe }}
     </main>
 
@@ -602,7 +649,7 @@ BASE_TEMPLATE = '''
         </div>
     </div>
 
-    <!-- Developer Panel -->
+    <!-- Developer Panel (double‑click footer to open) -->
     <div class="dev-panel" id="devPanel">
         <small><strong>Dev Console</strong></small><br>
         <button class="btn btn-sm btn-outline-light" onclick="clearCache()">Clear Cache</button>
@@ -649,7 +696,7 @@ BASE_TEMPLATE = '''
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js" defer></script>
     <script src="https://unpkg.com/aos@2.3.1/dist/aos.js" defer></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/lightbox2/2.11.4/js/lightbox.min.js" defer></script>
-    <script>
+    <script nonce="{{ g.nonce }}">
         var socket = io({ transports: ['polling'] });
         AOS.init({ duration: 800, once: true, offset: 100 });
 
@@ -808,7 +855,7 @@ BASE_TEMPLATE = '''
             scrollBtn.addEventListener('click', function() { window.scrollTo({ top: 0, behavior: 'smooth' }); });
         });
 
-        // Chat socket events (group/private)
+        // Socket events for chat
         socket.on('group_message', function(data) {
             var box = document.getElementById('group-chat-box');
             if (!box) return;
@@ -844,7 +891,6 @@ BASE_TEMPLATE = '''
             });
         });
 
-        // Typing indicators
         var typingTimeout;
         function emitTyping(room, receiverId) {
             socket.emit('typing', { room: room, receiver_id: receiverId });
@@ -874,7 +920,7 @@ BASE_TEMPLATE = '''
                 }
             });
 
-            // Submit group chat
+            // Group chat form
             var groupForm = document.getElementById('group-chat-form');
             if (groupForm) {
                 groupForm.addEventListener('submit', function(e) {
@@ -904,6 +950,8 @@ BASE_TEMPLATE = '''
 </body>
 </html>
 '''
+
+# ---- PAGE CONTENT TEMPLATES ----
 HOME_CONTENT = '''
 {% set bg_url = get_background_url() %}
 <section class="hero" style="{% if bg_url %}background: none;{% else %}background: linear-gradient(135deg, {{ primary_color }}, #0a58ca);{% endif %}">
@@ -1330,6 +1378,7 @@ LOGIN_CONTENT = '''
     </div>
 </div>
 '''
+
 DASHBOARD_CONTENT = '''
 <div class="container my-5">
     <h1 data-aos="fade-right">{{ _('dashboard') }}</h1>
@@ -1607,7 +1656,6 @@ CLASSROOM_ROOM_CONTENT = '''
 </script>
 '''
 
-# ----- Student Timetable & Attendance -----
 STUDENT_TIMETABLE_CONTENT = '''
 <div class="container my-5">
     <h1 data-aos="fade-right">My Timetable</h1>
@@ -1666,7 +1714,7 @@ STUDENT_ATTENDANCE_CONTENT = '''
 </div>
 '''
 
-# ----- Admin Templates (Dashboard, Settings, Logo, BG, Password) -----
+# ---- ADMIN TEMPLATES ----
 ADMIN_DASHBOARD_CONTENT = '''
 <div class="container-fluid my-4">
     <div class="row">
@@ -1804,9 +1852,6 @@ ADMIN_TRANSLATIONS_CONTENT = '''
     </div>
 </div>
 '''
-
-# ----- Admin CRUD templates (Users, Classes, Subjects, Results, Fees, News, Applications, Gallery) -----
-# These follow the same pattern as the previous version; included in the final script.
 
 ADMIN_USERS_CONTENT = '''
 <div class="container my-5">
@@ -2032,21 +2077,27 @@ ADMIN_FEES_CONTENT = '''
             <form method="POST" action="{{ url_for('admin_fees_add') }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div class="row g-2">
-                    <div class="col-md-3"><select class="form-select" name="student_id" required><option value="">Student</option>{% for s in students %}<option value="{{ s.id }}">{{ s.full_name }}</option>{% endfor %}</select></div>
+                    <div class="col-md-2"><select class="form-select" name="student_id" required><option value="">Student</option>{% for s in students %}<option value="{{ s.id }}">{{ s.full_name }}</option>{% endfor %}</select></div>
                     <div class="col-md-2"><input type="number" step="0.01" class="form-control" name="amount" placeholder="Amount" required></div>
                     <div class="col-md-2"><input type="date" class="form-control" name="paid_date" required></div>
-                    <div class="col-md-3"><input type="text" class="form-control" name="description" placeholder="Description"></div>
+                    <div class="col-md-2"><input type="text" class="form-control" name="description" placeholder="Description"></div>
+                    <div class="col-md-2">
+                        <select class="form-select" name="fee_type" required>
+                            <option value="charge">Charge</option>
+                            <option value="payment">Payment</option>
+                        </select>
+                    </div>
                     <div class="col-md-2"><button type="submit" class="btn btn-primary">Add</button></div>
                 </div>
             </form>
         </div>
     </div>
     <table class="table table-striped">
-        <thead><tr><th>Student</th><th>Amount</th><th>Paid Date</th><th>Description</th><th>Balance</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Student</th><th>Amount</th><th>Paid Date</th><th>Description</th><th>Type</th><th>Actions</th></tr></thead>
         <tbody>
         {% for f in fees %}
         <tr>
-            <td>{{ f.student_name }}</td><td>${{ f.amount }}</td><td>{{ f.paid_date.strftime('%Y-%m-%d') }}</td><td>{{ f.description or '-' }}</td><td>${{ f.balance }}</td>
+            <td>{{ f.student_name }}</td><td>${{ f.amount }}</td><td>{{ f.paid_date.strftime('%Y-%m-%d') }}</td><td>{{ f.description or '-' }}</td><td>{{ f.type|capitalize }}</td>
             <td><form method="POST" action="{{ url_for('admin_fees_delete', id=f.id) }}" style="display:inline;" onsubmit="return confirm('Delete this fee record?')"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit" class="btn btn-sm btn-danger">Delete</button></form></td>
         </tr>
         {% endfor %}
@@ -2163,7 +2214,6 @@ ADMIN_GALLERY_CONTENT = '''
 </div>
 '''
 
-# ----- Admin Timetable & Attendance -----
 ADMIN_TIMETABLE_CONTENT = '''
 <div class="container my-5">
     <h1 data-aos="fade-right">Manage Timetables</h1>
@@ -2272,7 +2322,6 @@ ADMIN_ATTENDANCE_CONTENT = '''
                     </div>
                 </div>
                 <div id="attendance-list">
-                    <!-- Students will be loaded via JavaScript or displayed here -->
                     <p class="text-muted">Select a class and date to mark attendance.</p>
                 </div>
             </form>
@@ -2302,20 +2351,22 @@ ADMIN_ATTENDANCE_CONTENT = '''
     </div>
 </div>
 '''
-# ------------------------------
-# Render Helper
-# ------------------------------
+
+# =============================================================================
+# RENDER HELPER
+# =============================================================================
 def render_page(title, content_template, lang='en', **kwargs):
     kwargs.setdefault('csrf_token', generate_csrf_token)
     kwargs.setdefault('get_background_url', get_background_url)
-    kwargs.setdefault('primary_color', get_cached_setting('primary_color', '#0d6efd'))
-    kwargs.setdefault('secondary_color', get_cached_setting('secondary_color', '#6c757d'))
-    kwargs.setdefault('footer_bg', get_cached_setting('footer_bg', '#1e2a3a'))
-    kwargs.setdefault('content_bg', get_cached_setting('content_bg', ''))
-    kwargs.setdefault('font_family', get_cached_setting('font_family', 'Segoe UI, system-ui, sans-serif'))
+    kwargs.setdefault('primary_color', get_setting('primary_color', '#0d6efd'))
+    kwargs.setdefault('secondary_color', get_setting('secondary_color', '#6c757d'))
+    kwargs.setdefault('footer_bg', get_setting('footer_bg', '#1e2a3a'))
+    kwargs.setdefault('content_bg', get_setting('content_bg', ''))
+    kwargs.setdefault('font_family', get_setting('font_family', 'Segoe UI, system-ui, sans-serif'))
     kwargs.setdefault('SCHOOL_LOGO', get_school_logo())
-    kwargs.setdefault('_', lambda key: get_cached_translation(key, lang))
+    kwargs.setdefault('_', lambda key: get_translation(key, lang))
     kwargs.setdefault('lang', lang)
+    kwargs.setdefault('g', g)
     content_rendered = render_template_string(content_template, **kwargs)
     return render_template_string(
         BASE_TEMPLATE,
@@ -2329,21 +2380,22 @@ def render_page(title, content_template, lang='en', **kwargs):
         SCHOOL_EMAIL=SCHOOL_EMAIL,
         SCHOOL_SHORT=SCHOOL_SHORT,
         SCHOOL_LOGO=get_school_logo(),
-        primary_color=get_cached_setting('primary_color', '#0d6efd'),
-        secondary_color=get_cached_setting('secondary_color', '#6c757d'),
-        footer_bg=get_cached_setting('footer_bg', '#1e2a3a'),
-        font_family=get_cached_setting('font_family', 'Segoe UI, system-ui, sans-serif'),
+        primary_color=get_setting('primary_color', '#0d6efd'),
+        secondary_color=get_setting('secondary_color', '#6c757d'),
+        footer_bg=get_setting('footer_bg', '#1e2a3a'),
+        font_family=get_setting('font_family', 'Segoe UI, system-ui, sans-serif'),
         request=request,
         url_for=url_for,
         session=session,
         csrf_token=generate_csrf_token,
         lang=lang,
-        _=lambda key: get_cached_translation(key, lang)
+        _=lambda key: get_translation(key, lang),
+        g=g
     )
 
-# ------------------------------
-# Routes: Public
-# ------------------------------
+# =============================================================================
+# PUBLIC ROUTES
+# =============================================================================
 @app.route('/')
 def home():
     lang = request.args.get('lang', session.get('lang', 'en'))
@@ -2389,8 +2441,13 @@ def admissions():
                 email=email, phone=phone, class_applied=class_applied
             )
             db.session.add(app)
-            db.session.commit()
-            flash('Application submitted successfully! We will contact you soon.', 'success')
+            try:
+                db.session.commit()
+                flash('Application submitted successfully! We will contact you soon.', 'success')
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"Application submission error: {e}")
+                flash('An error occurred. Please try again.', 'danger')
             return redirect(url_for('admissions'))
         else:
             flash('Please fill in all fields.', 'danger')
@@ -2576,9 +2633,9 @@ def classroom_room(room):
     messages = list(reversed(messages))
     return render_page('Classroom Room', CLASSROOM_ROOM_CONTENT, lang=lang, room=room, messages=messages)
 
-# ------------------------------
-# Routes: AI Assistant
-# ------------------------------
+# =============================================================================
+# AI ROUTE
+# =============================================================================
 @app.route('/ai/ask', methods=['POST'])
 @limiter.limit("10 per minute")
 def ai_ask():
@@ -2596,13 +2653,14 @@ def ai_ask():
         )
         db.session.add(conv)
         db.session.commit()
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"AI conversation save error: {e}")
+        db.session.rollback()
     return jsonify({'answer': answer})
 
-# ------------------------------
-# Routes: Health Check
-# ------------------------------
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
 @app.route('/health')
 def health_check():
     import time
@@ -2611,24 +2669,25 @@ def health_check():
         db.session.execute(text('SELECT 1'))
         db_time = int((time.time() - start) * 1000)
         status = 'ok'
-    except:
+    except Exception as e:
         db_time = 0
         status = 'error'
+        logger.error(f"Health check DB error: {e}")
     memory = 'N/A'
-    if psutil:
-        try:
-            memory = f"{psutil.virtual_memory().available // (1024 * 1024)} MB"
-        except:
-            pass
+    try:
+        memory = f"{psutil.virtual_memory().available // (1024 * 1024)} MB"
+    except:
+        pass
     return jsonify({
         'status': status,
         'db': db_time,
         'memory': memory
     })
 
-# ------------------------------
-# Routes: Admin (all CRUD)
-# ------------------------------
+# =============================================================================
+# ADMIN ROUTES (full CRUD with CSRF and error handling)
+# =============================================================================
+
 @app.route('/admin')
 @login_required
 @role_required('admin')
@@ -2646,48 +2705,54 @@ def admin_dashboard():
 @app.route('/admin/settings', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_settings():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_settings'))
-        update_setting('primary_color', sanitize_html(request.form.get('primary_color', '#0d6efd')))
-        update_setting('secondary_color', sanitize_html(request.form.get('secondary_color', '#6c757d')))
-        update_setting('footer_bg', sanitize_html(request.form.get('footer_bg', '#1e2a3a')))
-        update_setting('content_bg', sanitize_html(request.form.get('content_bg', '')))
-        update_setting('font_family', sanitize_html(request.form.get('font_family', 'Segoe UI, system-ui, sans-serif')))
-        flash('Settings updated.', 'success')
+        try:
+            update_setting('primary_color', sanitize_html(request.form.get('primary_color', '#0d6efd')))
+            update_setting('secondary_color', sanitize_html(request.form.get('secondary_color', '#6c757d')))
+            update_setting('footer_bg', sanitize_html(request.form.get('footer_bg', '#1e2a3a')))
+            update_setting('content_bg', sanitize_html(request.form.get('content_bg', '')))
+            update_setting('font_family', sanitize_html(request.form.get('font_family', 'Segoe UI, system-ui, sans-serif')))
+            flash('Settings updated.', 'success')
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Settings update error: {e}")
+            flash('An error occurred.', 'danger')
         return redirect(url_for('admin_settings'))
     return render_page('Site Settings', ADMIN_SETTINGS_CONTENT, lang=lang,
-        primary_color=get_cached_setting('primary_color', '#0d6efd'),
-        secondary_color=get_cached_setting('secondary_color', '#6c757d'),
-        footer_bg=get_cached_setting('footer_bg', '#1e2a3a'),
-        content_bg=get_cached_setting('content_bg', ''),
-        font_family=get_cached_setting('font_family', 'Segoe UI, system-ui, sans-serif')
+        primary_color=get_setting('primary_color', '#0d6efd'),
+        secondary_color=get_setting('secondary_color', '#6c757d'),
+        footer_bg=get_setting('footer_bg', '#1e2a3a'),
+        content_bg=get_setting('content_bg', ''),
+        font_family=get_setting('font_family', 'Segoe UI, system-ui, sans-serif')
     )
 
 @app.route('/admin/translations', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_translations():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_translations'))
-        for key in request.form:
-            if key.startswith('en_'):
-                t_key = key[3:]
-                t = Translation.query.filter_by(key=t_key).first()
-                if t:
-                    t.en = sanitize_html(request.form.get(key, ''))
-                    t.fr = sanitize_html(request.form.get(f'fr_{t_key}', ''))
-                    t.sn = sanitize_html(request.form.get(f'sn_{t_key}', ''))
-        db.session.commit()
-        flash('Translations updated.', 'success')
+        try:
+            for key in request.form:
+                if key.startswith('en_'):
+                    t_key = key[3:]
+                    t = Translation.query.filter_by(key=t_key).first()
+                    if t:
+                        t.en = sanitize_html(request.form.get(key, ''))
+                        t.fr = sanitize_html(request.form.get(f'fr_{t_key}', ''))
+                        t.sn = sanitize_html(request.form.get(f'sn_{t_key}', ''))
+            db.session.commit()
+            flash('Translations updated.', 'success')
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Translation update error: {e}")
+            flash('An error occurred.', 'danger')
         return redirect(url_for('admin_translations'))
     translations = Translation.query.all()
     return render_page('Manage Translations', ADMIN_TRANSLATIONS_CONTENT, lang=lang, translations=translations)
@@ -2695,13 +2760,11 @@ def admin_translations():
 @app.route('/admin/change-password', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_change_password():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_change_password'))
         current = request.form.get('current_password')
         new = request.form.get('new_password')
         confirm = request.form.get('confirm_password')
@@ -2717,21 +2780,24 @@ def admin_change_password():
             flash('Current password is incorrect.', 'danger')
             return redirect(url_for('admin_change_password'))
         user.set_password(new)
-        db.session.commit()
-        flash('Password changed successfully.', 'success')
-        return redirect(url_for('admin_dashboard'))
+        try:
+            db.session.commit()
+            flash('Password changed successfully.', 'success')
+            return redirect(url_for('admin_dashboard'))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Password change error: {e}")
+            flash('An error occurred.', 'danger')
     return render_page('Change Password', ADMIN_CHANGE_PASSWORD_CONTENT, lang=lang)
 
 @app.route('/admin/upload-logo', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_upload_logo():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_upload_logo'))
         if 'logo' not in request.files:
             flash('No file selected.', 'danger')
             return redirect(url_for('admin_upload_logo'))
@@ -2755,13 +2821,11 @@ def admin_upload_logo():
 @app.route('/admin/upload-background', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_upload_background():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_upload_background'))
         if 'background' not in request.files:
             flash('No file selected.', 'danger')
             return redirect(url_for('admin_upload_background'))
@@ -2782,7 +2846,7 @@ def admin_upload_background():
     bg_url = get_background_url()
     return render_page('Upload Background', ADMIN_BG_CONTENT, lang=lang, bg_url=bg_url)
 
-# ---------- Admin Users ----------
+# ---- Admin Users CRUD ----
 @app.route('/admin/users')
 @login_required
 @role_required('admin')
@@ -2800,13 +2864,11 @@ def admin_users():
 @app.route('/admin/users/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_users_add():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_users_add'))
         username = sanitize_html(request.form.get('username'))
         password = request.form.get('password')
         full_name = sanitize_html(request.form.get('full_name'))
@@ -2828,48 +2890,61 @@ def admin_users_add():
             db.session.commit()
             flash('User added.', 'success')
             return redirect(url_for('admin_users'))
-        except:
+        except IntegrityError:
             db.session.rollback()
             flash('Username or email already exists.', 'danger')
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"User add error: {e}")
+            flash('An error occurred.', 'danger')
     classes = Class.query.all()
     return render_page('Add User', ADMIN_USERS_ADD_CONTENT, lang=lang, classes=classes)
 
 @app.route('/admin/users/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_users_edit(id):
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     user = User.query.get_or_404(id)
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_users_edit', id=id))
         user.full_name = sanitize_html(request.form.get('full_name'))
         user.email = sanitize_html(request.form.get('email'))
         user.role = sanitize_html(request.form.get('role'))
         user.student_id = sanitize_html(request.form.get('student_id'))
         user.class_id = request.form.get('class_id')
-        db.session.commit()
-        flash('User updated.', 'success')
-        return redirect(url_for('admin_users'))
+        try:
+            db.session.commit()
+            flash('User updated.', 'success')
+            return redirect(url_for('admin_users'))
+        except IntegrityError:
+            db.session.rollback()
+            flash('Email already exists.', 'danger')
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"User edit error: {e}")
+            flash('An error occurred.', 'danger')
     classes = Class.query.all()
     return render_page('Edit User', ADMIN_USERS_EDIT_CONTENT, lang=lang, user=user, classes=classes)
 
 @app.route('/admin/users/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_users_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_users'))
     user = User.query.get_or_404(id)
     db.session.delete(user)
-    db.session.commit()
-    flash('User deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('User deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"User delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_users'))
 
-# ---------- Admin Classes ----------
+# ---- Admin Classes CRUD ----
 @app.route('/admin/classes')
 @login_required
 @role_required('admin')
@@ -2888,13 +2963,11 @@ def admin_classes():
 @app.route('/admin/classes/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_classes_add():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_classes_add'))
         name = sanitize_html(request.form.get('name'))
         academic_year = sanitize_html(request.form.get('academic_year'))
         teacher_id = request.form.get('teacher_id')
@@ -2903,46 +2976,57 @@ def admin_classes_add():
             return redirect(url_for('admin_classes_add'))
         cls = Class(name=name, academic_year=academic_year, teacher_id=teacher_id or None)
         db.session.add(cls)
-        db.session.commit()
-        flash('Class added.', 'success')
-        return redirect(url_for('admin_classes'))
+        try:
+            db.session.commit()
+            flash('Class added.', 'success')
+            return redirect(url_for('admin_classes'))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Class add error: {e}")
+            flash('An error occurred.', 'danger')
     teachers = User.query.filter_by(role='teacher').all()
     return render_page('Add Class', ADMIN_CLASSES_ADD_CONTENT, lang=lang, teachers=teachers)
 
 @app.route('/admin/classes/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_classes_edit(id):
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     cls = Class.query.get_or_404(id)
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_classes_edit', id=id))
         cls.name = sanitize_html(request.form.get('name'))
         cls.academic_year = sanitize_html(request.form.get('academic_year'))
         cls.teacher_id = request.form.get('teacher_id') or None
-        db.session.commit()
-        flash('Class updated.', 'success')
-        return redirect(url_for('admin_classes'))
+        try:
+            db.session.commit()
+            flash('Class updated.', 'success')
+            return redirect(url_for('admin_classes'))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Class edit error: {e}")
+            flash('An error occurred.', 'danger')
     teachers = User.query.filter_by(role='teacher').all()
     return render_page('Edit Class', ADMIN_CLASSES_EDIT_CONTENT, lang=lang, cls=cls, teachers=teachers)
 
 @app.route('/admin/classes/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_classes_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_classes'))
     cls = Class.query.get_or_404(id)
     db.session.delete(cls)
-    db.session.commit()
-    flash('Class deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('Class deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Class delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_classes'))
 
-# ---------- Admin Subjects ----------
+# ---- Admin Subjects CRUD ----
 @app.route('/admin/subjects')
 @login_required
 @role_required('admin')
@@ -2955,65 +3039,72 @@ def admin_subjects():
 @app.route('/admin/subjects/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_subjects_add():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_subjects_add'))
         name = sanitize_html(request.form.get('name'))
         code = sanitize_html(request.form.get('code'))
         if not name or not code:
             flash('Name and Code are required.', 'danger')
             return redirect(url_for('admin_subjects_add'))
+        subject = Subject(name=name, code=code)
+        db.session.add(subject)
         try:
-            subject = Subject(name=name, code=code)
-            db.session.add(subject)
             db.session.commit()
             flash('Subject added.', 'success')
             return redirect(url_for('admin_subjects'))
-        except:
+        except IntegrityError:
             db.session.rollback()
             flash('Subject code already exists.', 'danger')
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Subject add error: {e}")
+            flash('An error occurred.', 'danger')
     return render_page('Add Subject', ADMIN_SUBJECTS_ADD_CONTENT, lang=lang)
 
 @app.route('/admin/subjects/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_subjects_edit(id):
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     subject = Subject.query.get_or_404(id)
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_subjects_edit', id=id))
         subject.name = sanitize_html(request.form.get('name'))
         subject.code = sanitize_html(request.form.get('code'))
         try:
             db.session.commit()
             flash('Subject updated.', 'success')
             return redirect(url_for('admin_subjects'))
-        except:
+        except IntegrityError:
             db.session.rollback()
             flash('Subject code already exists.', 'danger')
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Subject edit error: {e}")
+            flash('An error occurred.', 'danger')
     return render_page('Edit Subject', ADMIN_SUBJECTS_EDIT_CONTENT, lang=lang, subject=subject)
 
 @app.route('/admin/subjects/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_subjects_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_subjects'))
     subject = Subject.query.get_or_404(id)
     db.session.delete(subject)
-    db.session.commit()
-    flash('Subject deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('Subject deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Subject delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_subjects'))
 
-# ---------- Admin Results ----------
+# ---- Admin Results ----
 @app.route('/admin/results')
 @login_required
 @role_required('admin')
@@ -3033,10 +3124,8 @@ def admin_results():
 @app.route('/admin/results/add', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_results_add():
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_results'))
     student_id = request.form.get('student_id')
     subject_id = request.form.get('subject_id')
     exam_type = sanitize_html(request.form.get('exam_type'))
@@ -3049,24 +3138,32 @@ def admin_results_add():
         return redirect(url_for('admin_results'))
     result = Result(student_id=student_id, subject_id=subject_id, exam_type=exam_type, marks=marks, grade=grade, term=term, year=year)
     db.session.add(result)
-    db.session.commit()
-    flash('Result added.', 'success')
+    try:
+        db.session.commit()
+        flash('Result added.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Result add error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_results'))
 
 @app.route('/admin/results/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_results_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_results'))
     result = Result.query.get_or_404(id)
     db.session.delete(result)
-    db.session.commit()
-    flash('Result deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('Result deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Result delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_results'))
 
-# ---------- Admin Fees ----------
+# ---- Admin Fees ----
 @app.route('/admin/fees')
 @login_required
 @role_required('admin')
@@ -3085,43 +3182,46 @@ def admin_fees():
 @app.route('/admin/fees/add', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_fees_add():
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_fees'))
     student_id = request.form.get('student_id')
     amount = request.form.get('amount')
     date_str = request.form.get('paid_date')
     description = sanitize_html(request.form.get('description'))
-    if not all([student_id, amount, date_str]):
-        flash('Student, Amount, and Date are required.', 'danger')
+    fee_type = request.form.get('fee_type')
+    if not all([student_id, amount, date_str, fee_type]):
+        flash('All fields are required.', 'danger')
         return redirect(url_for('admin_fees'))
-    fee = FeeTransaction(
-        student_id=student_id,
-        type='payment',  # we treat additions as payments (negative charge)
-        amount=float(amount),
-        description=description,
-        date=datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-    )
-    db.session.add(fee)
-    db.session.commit()
-    flash('Fee record added.', 'success')
+    date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+    try:
+        if fee_type == 'charge':
+            add_fee_charge(int(student_id), float(amount), description, date_obj)
+        else:
+            add_fee_payment(int(student_id), float(amount), description, date_obj)
+        flash('Fee record added.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Fee add error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_fees'))
 
 @app.route('/admin/fees/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_fees_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_fees'))
     fee = FeeTransaction.query.get_or_404(id)
     db.session.delete(fee)
-    db.session.commit()
-    flash('Fee record deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('Fee record deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Fee delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_fees'))
 
-# ---------- Admin News ----------
+# ---- Admin News ----
 @app.route('/admin/news')
 @login_required
 @role_required('admin')
@@ -3139,13 +3239,11 @@ def admin_news():
 @app.route('/admin/news/add', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_news_add():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_news_add'))
         title = sanitize_html(request.form.get('title'))
         content = sanitize_html(request.form.get('content'))
         image_url = sanitize_html(request.form.get('image_url'))
@@ -3164,22 +3262,25 @@ def admin_news_add():
             return redirect(url_for('admin_news_add'))
         news = News(title=title, content=content, image_url=image_url, video_url=video_url, author_id=session['user_id'])
         db.session.add(news)
-        db.session.commit()
-        flash('News article added.', 'success')
-        return redirect(url_for('admin_news'))
+        try:
+            db.session.commit()
+            flash('News article added.', 'success')
+            return redirect(url_for('admin_news'))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"News add error: {e}")
+            flash('An error occurred.', 'danger')
     return render_page('Add News', ADMIN_NEWS_ADD_CONTENT, lang=lang)
 
 @app.route('/admin/news/edit/<int:id>', methods=['GET', 'POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_news_edit(id):
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     article = News.query.get_or_404(id)
     if request.method == 'POST':
-        if not validate_csrf_token(request.form.get('csrf_token')):
-            flash('Invalid CSRF token.', 'danger')
-            return redirect(url_for('admin_news_edit', id=id))
         title = sanitize_html(request.form.get('title'))
         content = sanitize_html(request.form.get('content'))
         image_url = sanitize_html(request.form.get('image_url'))
@@ -3204,29 +3305,37 @@ def admin_news_edit(id):
         article.content = content
         article.image_url = image_url
         article.video_url = video_url
-        db.session.commit()
-        flash('News updated.', 'success')
-        return redirect(url_for('admin_news'))
+        try:
+            db.session.commit()
+            flash('News updated.', 'success')
+            return redirect(url_for('admin_news'))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"News edit error: {e}")
+            flash('An error occurred.', 'danger')
     return render_page('Edit News', ADMIN_NEWS_EDIT_CONTENT, lang=lang, article=article)
 
 @app.route('/admin/news/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_news_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_news'))
     article = News.query.get_or_404(id)
     if article.image_url and article.image_url.startswith('/static/uploads/'):
         old_path = os.path.join('.', article.image_url.lstrip('/'))
         if os.path.exists(old_path):
             os.remove(old_path)
     db.session.delete(article)
-    db.session.commit()
-    flash('News deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('News deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"News delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_news'))
 
-# ---------- Admin Applications ----------
+# ---- Admin Applications ----
 @app.route('/admin/applications')
 @login_required
 @role_required('admin')
@@ -3241,7 +3350,7 @@ def admin_applications():
     apps = Application.query.order_by(Application.date_applied.desc()).offset(offset).limit(per_page).all()
     return render_page('Manage Applications', ADMIN_APPLICATIONS_CONTENT, lang=lang, apps=apps, current_page=page, total_pages=total_pages)
 
-# ---------- Admin Gallery ----------
+# ---- Admin Gallery ----
 @app.route('/admin/gallery')
 @login_required
 @role_required('admin')
@@ -3259,10 +3368,8 @@ def admin_gallery():
 @app.route('/admin/gallery/add', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_gallery_add():
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_gallery'))
     if 'image' not in request.files:
         flash('No image file provided.', 'danger')
         return redirect(url_for('admin_gallery'))
@@ -3281,54 +3388,59 @@ def admin_gallery_add():
     description = sanitize_html(request.form.get('description'))
     img = Gallery(title=title, image_url=image_url, description=description, uploaded_by=session['user_id'])
     db.session.add(img)
-    db.session.commit()
-    flash('Image uploaded successfully.', 'success')
+    try:
+        db.session.commit()
+        flash('Image uploaded successfully.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Gallery add error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_gallery'))
 
 @app.route('/admin/gallery/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_gallery_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_gallery'))
     img = Gallery.query.get_or_404(id)
     if img.image_url.startswith('/static/gallery/'):
         old_path = os.path.join('.', img.image_url.lstrip('/'))
         if os.path.exists(old_path):
             os.remove(old_path)
     db.session.delete(img)
-    db.session.commit()
-    flash('Image deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('Image deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Gallery delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_gallery'))
 
-# ---------- Admin Timetable ----------
+# ---- Admin Timetable ----
 @app.route('/admin/timetable')
 @login_required
 @role_required('admin')
 def admin_timetable():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
-    slots = db.session.query(TimetableSlot, Class, Subject, User).join(Class, TimetableSlot.class_id == Class.id).join(Subject, TimetableSlot.subject_id == Subject.id).outerjoin(User, TimetableSlot.teacher_id == User.id).all()
-    classes = Class.query.all()
-    subjects = Subject.query.all()
-    teachers = User.query.filter_by(role='teacher').all()
-    # Build slot objects with class_name, subject_name, teacher_name
-    slot_data = []
-    for slot, cls, subj, user in slots:
+    slots_raw = db.session.query(TimetableSlot, Class, Subject, User).join(Class, TimetableSlot.class_id == Class.id).join(Subject, TimetableSlot.subject_id == Subject.id).outerjoin(User, TimetableSlot.teacher_id == User.id).all()
+    slots = []
+    for slot, cls, subj, user in slots_raw:
         slot.class_name = cls.name
         slot.subject_name = subj.name
         slot.teacher_name = user.full_name if user else None
-        slot_data.append(slot)
-    return render_page('Manage Timetable', ADMIN_TIMETABLE_CONTENT, lang=lang, slots=slot_data, classes=classes, subjects=subjects, teachers=teachers)
+        slots.append(slot)
+    classes = Class.query.all()
+    subjects = Subject.query.all()
+    teachers = User.query.filter_by(role='teacher').all()
+    return render_page('Manage Timetable', ADMIN_TIMETABLE_CONTENT, lang=lang, slots=slots, classes=classes, subjects=subjects, teachers=teachers)
 
 @app.route('/admin/timetable/add', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_timetable_add():
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_timetable'))
     class_id = request.form.get('class_id')
     day = request.form.get('day')
     period = request.form.get('period')
@@ -3347,24 +3459,32 @@ def admin_timetable_add():
         room=room
     )
     db.session.add(slot)
-    db.session.commit()
-    flash('Timetable slot added.', 'success')
+    try:
+        db.session.commit()
+        flash('Timetable slot added.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Timetable add error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_timetable'))
 
 @app.route('/admin/timetable/delete/<int:id>', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_timetable_delete(id):
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_timetable'))
     slot = TimetableSlot.query.get_or_404(id)
     db.session.delete(slot)
-    db.session.commit()
-    flash('Slot deleted.', 'success')
+    try:
+        db.session.commit()
+        flash('Slot deleted.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Timetable delete error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_timetable'))
 
-# ---------- Admin Attendance ----------
+# ---- Admin Attendance ----
 @app.route('/admin/attendance')
 @login_required
 @role_required('admin')
@@ -3372,21 +3492,18 @@ def admin_attendance():
     lang = request.args.get('lang', session.get('lang', 'en'))
     session['lang'] = lang
     classes = Class.query.all()
-    records = db.session.query(Attendance, User).join(User, Attendance.student_id == User.id).order_by(Attendance.date.desc()).limit(100).all()
-    # Build record objects with student_name
-    record_data = []
-    for att, user in records:
+    records_raw = db.session.query(Attendance, User).join(User, Attendance.student_id == User.id).order_by(Attendance.date.desc()).limit(100).all()
+    records = []
+    for att, user in records_raw:
         att.student_name = user.full_name
-        record_data.append(att)
-    return render_page('Manage Attendance', ADMIN_ATTENDANCE_CONTENT, lang=lang, classes=classes, records=record_data)
+        records.append(att)
+    return render_page('Manage Attendance', ADMIN_ATTENDANCE_CONTENT, lang=lang, classes=classes, records=records)
 
 @app.route('/admin/attendance/mark', methods=['POST'])
 @login_required
 @role_required('admin')
+@csrf_required
 def admin_attendance_mark():
-    if not validate_csrf_token(request.form.get('csrf_token')):
-        flash('Invalid CSRF token.', 'danger')
-        return redirect(url_for('admin_attendance'))
     class_id = request.form.get('class_id')
     date_str = request.form.get('date')
     if not class_id or not date_str:
@@ -3398,7 +3515,6 @@ def admin_attendance_mark():
         status = request.form.get(f'status_{student.id}')
         remarks = request.form.get(f'remarks_{student.id}')
         if status:
-            # Check if attendance already exists for this student/date
             att = Attendance.query.filter_by(student_id=student.id, date=date_obj).first()
             if att:
                 att.status = status
@@ -3414,20 +3530,18 @@ def admin_attendance_mark():
                     teacher_id=session['user_id']
                 )
                 db.session.add(att)
-    db.session.commit()
-    flash('Attendance marked successfully.', 'success')
+    try:
+        db.session.commit()
+        flash('Attendance marked successfully.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Attendance mark error: {e}")
+        flash('An error occurred.', 'danger')
     return redirect(url_for('admin_attendance'))
 
-# ------------------------------
-# Serve static files
-# ------------------------------
-@app.route('/static/<path:filename>')
-def static_files(filename):
-    return send_from_directory('static', filename)
-
-# ------------------------------
-# SocketIO Events
-# ------------------------------
+# =============================================================================
+# SOCKETIO EVENTS
+# =============================================================================
 @socketio.on('group_message')
 def handle_group_message(data):
     if 'user_id' not in session:
@@ -3437,14 +3551,18 @@ def handle_group_message(data):
         return
     chat = ChatMessage(sender_id=session['user_id'], room='group', message=msg)
     db.session.add(chat)
-    db.session.commit()
-    emit('group_message', {
-        'id': chat.id,
-        'sender_id': session['user_id'],
-        'sender_name': session['full_name'],
-        'message': msg,
-        'timestamp': chat.timestamp.isoformat()
-    }, broadcast=True)
+    try:
+        db.session.commit()
+        emit('group_message', {
+            'id': chat.id,
+            'sender_id': session['user_id'],
+            'sender_name': session['full_name'],
+            'message': msg,
+            'timestamp': chat.timestamp.isoformat()
+        }, broadcast=True)
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Group message error: {e}")
 
 @socketio.on('private_message')
 def handle_private_message(data):
@@ -3456,16 +3574,20 @@ def handle_private_message(data):
         return
     chat = ChatMessage(sender_id=session['user_id'], receiver_id=receiver_id, room='private_admin', message=msg)
     db.session.add(chat)
-    db.session.commit()
-    payload = {
-        'id': chat.id,
-        'sender_id': session['user_id'],
-        'sender_name': session['full_name'],
-        'message': msg,
-        'timestamp': chat.timestamp.isoformat()
-    }
-    emit('private_message', payload, room=str(session['user_id']))
-    emit('private_message', payload, room=str(receiver_id))
+    try:
+        db.session.commit()
+        payload = {
+            'id': chat.id,
+            'sender_id': session['user_id'],
+            'sender_name': session['full_name'],
+            'message': msg,
+            'timestamp': chat.timestamp.isoformat()
+        }
+        emit('private_message', payload, room=str(session['user_id']))
+        emit('private_message', payload, room=str(receiver_id))
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Private message error: {e}")
 
 @socketio.on('classroom_message')
 def handle_classroom_message(data):
@@ -3477,16 +3599,20 @@ def handle_classroom_message(data):
         return
     chat = ChatMessage(sender_id=session['user_id'], room=room, message=msg)
     db.session.add(chat)
-    db.session.commit()
-    payload = {
-        'id': chat.id,
-        'sender_id': session['user_id'],
-        'sender_name': session['full_name'],
-        'room': room,
-        'message': msg,
-        'timestamp': chat.timestamp.isoformat()
-    }
-    emit('classroom_message', payload, room=room)
+    try:
+        db.session.commit()
+        payload = {
+            'id': chat.id,
+            'sender_id': session['user_id'],
+            'sender_name': session['full_name'],
+            'room': room,
+            'message': msg,
+            'timestamp': chat.timestamp.isoformat()
+        }
+        emit('classroom_message', payload, room=room)
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Classroom message error: {e}")
 
 @socketio.on('typing')
 def handle_typing(data):
@@ -3525,16 +3651,20 @@ def handle_mark_read(data):
     chat = ChatMessage.query.get(msg_id)
     if chat and chat.receiver_id == session['user_id']:
         chat.read_at = datetime.datetime.utcnow()
-        db.session.commit()
-        emit('message_read', {'message_id': msg_id}, room=str(chat.sender_id))
+        try:
+            db.session.commit()
+            emit('message_read', {'message_id': msg_id}, room=str(chat.sender_id))
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Mark read error: {e}")
 
-# ------------------------------
-# Run Application
-# ------------------------------
+# =============================================================================
+# RUN APPLICATION
+# =============================================================================
 if __name__ == '__main__':
     os.makedirs('static/uploads', exist_ok=True)
     os.makedirs('static/gallery', exist_ok=True)
     socketio.run(app, host='0.0.0.0', port=5000)
-    
+
     
     
